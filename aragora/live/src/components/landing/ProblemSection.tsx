@@ -51,7 +51,7 @@ export function ProblemSection() {
             marginBottom: '20px',
           }}
         >
-          {isDark ? '> THE PROBLEM' : 'THE PROBLEM'}
+          {isDark ? '> WHY THIS MATTERS' : 'WHY THIS MATTERS'}
         </p>
 
         {/* Statement */}

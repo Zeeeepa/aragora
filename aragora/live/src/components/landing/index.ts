@@ -19,3 +19,6 @@ export {
   type UseCaseItem,
   type UseCaseSelectorProps,
 } from './UseCaseSelector';
+export { FeatureShowcase } from './FeatureShowcase';
+export { IntegrationsGrid } from './IntegrationsGrid';
+export { LiveDemoSection } from './LiveDemoSection';
