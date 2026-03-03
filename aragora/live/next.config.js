@@ -43,6 +43,11 @@ const nextConfig = {
         async redirects() {
           return [
             {
+              source: '/',
+              destination: '/landing/',
+              permanent: false,
+            },
+            {
               source: '/docs',
               destination: 'https://docs.aragora.ai',
               permanent: false,
