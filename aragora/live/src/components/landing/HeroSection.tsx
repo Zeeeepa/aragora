@@ -233,7 +233,7 @@ export function HeroSection(props: Partial<HeroSectionProps> & Record<string, un
           </span>
         </h1>
 
-        {/* Subtitle — short, one line on desktop */}
+        {/* Subtitle — single line on desktop */}
         <p
           className="max-w-2xl mx-auto leading-relaxed"
           style={{
@@ -341,7 +341,7 @@ export function HeroSection(props: Partial<HeroSectionProps> & Record<string, un
           </div>
         )}
 
-                {/* Loading state */}
+        {/* Loading state */}
         {isRunning && (
           <div className="flex flex-col items-center py-8 gap-3">
             <div className="flex items-center gap-3" style={{ color: 'var(--accent)' }}>
