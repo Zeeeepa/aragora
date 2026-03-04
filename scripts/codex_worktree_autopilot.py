@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -479,6 +480,36 @@ def _branch_ahead_count(repo_root: Path, base: str, branch: str) -> int:
     return int(out) if out.isdigit() else 0
 
 
+def _has_active_session(worktree_path: Path) -> bool:
+    """Check if a worktree has an active Claude session via lock file.
+
+    The lock file (.claude-session-active) is created by the SessionStart hook
+    and removed by the Stop hook. If the file exists and the recorded PID is
+    still running, the session is active and the worktree must not be deleted.
+    """
+    lock_file = worktree_path / ".claude-session-active"
+    if not lock_file.exists():
+        return False
+    try:
+        data = json.loads(lock_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    # Check if the parent PID (Claude Code process) is still running
+    ppid = data.get("ppid", 0)
+    pid = data.get("pid", 0)
+    for check_pid in (ppid, pid):
+        if check_pid and check_pid > 0:
+            try:
+                os.kill(check_pid, 0)  # Signal 0 = existence check, no actual signal
+                return True  # Process is alive
+            except ProcessLookupError:
+                continue  # Process is dead, check next
+            except PermissionError:
+                return True  # Process exists but owned by another user
+    # Both PIDs are dead — stale lock file, safe to clean up
+    return False
+
+
 def _remove_worktree(repo_root: Path, path: Path) -> bool:
     proc = _run_git(repo_root, "worktree", "remove", "--force", str(path))
     return proc.returncode == 0
@@ -508,6 +539,8 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
     failed_worktree_removals = 0
     failed_branch_deletions = 0
 
+    skipped_active_session = 0
+
     for session in state.get("sessions", []):
         path = Path(str(session.get("path", ""))).resolve()
         branch = str(session.get("branch", ""))
@@ -519,6 +552,14 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
 
         if not stale and not expired:
             kept.append(session)
+            continue
+
+        # CRITICAL: Never delete a worktree with an active Claude session.
+        # The .claude-session-active lock file is created at session start
+        # and removed at session end. If the PID is still alive, skip.
+        if path.exists() and _has_active_session(path):
+            kept.append(session)
+            skipped_active_session += 1
             continue
 
         if active and branch:
@@ -550,6 +591,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
         "removed": removed,
         "kept": len(kept),
         "skipped_unmerged": skipped_unmerged,
+        "skipped_active_session": skipped_active_session,
         "failed_worktree_removals": failed_worktree_removals,
         "failed_branch_deletions": failed_branch_deletions,
     }
@@ -559,6 +601,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
         print(
             f"cleanup complete: removed={removed} kept={len(kept)} "
             f"skipped_unmerged={skipped_unmerged} "
+            f"skipped_active_session={skipped_active_session} "
             f"failed_worktree_removals={failed_worktree_removals} "
             f"failed_branch_deletions={failed_branch_deletions}"
         )

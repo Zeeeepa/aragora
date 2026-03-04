@@ -14,6 +14,9 @@ __pycache__/
 .aragora_sessions.json
 .aragora_events/
 
+# Worktree session lock files (created by SessionStart hook, removed on Stop)
+.claude-session-active
+
 # C extensions
 *.so
 

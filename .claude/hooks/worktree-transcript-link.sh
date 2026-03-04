@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# worktree-transcript-link.sh — Stop hook that symlinks transcript files
-# for worktree sessions so plugins (e.g. claude-mem) can find them.
+# worktree-transcript-link.sh — Stop hook that:
+# 1. Symlinks transcript files for worktree sessions so plugins can find them
+# 2. Removes session lock file (.claude-session-active) to allow cleanup
 #
 # Problem: When Claude Code runs in a worktree (e.g. .claude/worktrees/foo),
 # it creates a project dir based on the worktree path, but the transcript
@@ -12,11 +13,20 @@
 #
 # Safe for multiple concurrent sessions — each has a unique session UUID.
 
+# Defensive: if CWD doesn't exist (worktree was deleted), exit gracefully.
+# This prevents the /bin/sh ENOENT cascade.
+if ! cd "${PWD}" 2>/dev/null; then
+  exit 0
+fi
+
 set -euo pipefail
 
 CWD="$(pwd)"
 
-# Only act if we're in a worktree
+# Remove session lock file (always, even for non-worktree sessions)
+rm -f "${CWD}/.claude-session-active" 2>/dev/null || true
+
+# Only act on transcript linking if we're in a worktree
 if [[ "$CWD" != *"/.worktrees/"* ]] && [[ "$CWD" != *"/.claude/worktrees/"* ]]; then
   exit 0
 fi
