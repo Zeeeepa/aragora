@@ -682,3 +682,77 @@ Summary:
 - **GO** for continued strict section + grounding gates (stable).
 - **NO-GO** for prompt-only duplicate suppression.
 - **Next required change**: add deterministic duplicate-create defecting/repair in `aragora/debate/output_quality.py` and gate on `duplicate_existing_create_ratio <= 0.25`.
+
+---
+
+## Dogfood Run 008g Results (Fail-Fast Runtime + RLM-Limiter Off)
+
+### Date
+- 2026-03-04
+
+### Goal
+- Validate the new duplicate-create deterministic enforcement under real runs and reduce long-stall behavior by:
+  - disabling post-consensus upgrade loops
+  - disabling context-init RLM limiter
+  - keeping strict timeout reports enabled
+
+### Configuration
+- **Team**: 3 agents via OpenRouter (`claude-sonnet-4` proposer, `gpt-4o` critic, `gemini-2.0-flash-001` synthesizer)
+- **Rounds**: 1
+- **Consensus**: majority
+- **Runtime controls**:
+  - `--no-context-init-rlm`
+  - `--no-upgrade-to-good`
+  - `--quality-concretize-max-rounds 0`
+  - `--quality-extra-assessment-rounds 0`
+  - `--timeout 240`
+- **Context mode**:
+  - `--codebase-context --codebase-context-path <repo>`
+  - no harness explorers in this benchmark leg
+
+### Execution Results
+
+| Variant | Exit | Duration | Final answer present | Timeout report |
+|---|---:|---:|---:|---:|
+| Control | 1 | 246.324s | No | Yes |
+| Focused | 0 | 238.615s | Yes | No |
+
+### Objective Score (`scripts/dogfood_score.py`)
+
+| Metric | Baseline (Control) | Enhanced (Focused) |
+|---|---:|---:|
+| Composite score | 0.0 | **0.9256** |
+| Quality score | N/A (timeout) | 9.0 |
+| Practicality score | N/A (timeout) | 9.03 |
+| Verified existing path ratio | N/A (timeout) | 0.90 |
+| Duplicate existing create-ratio | N/A (timeout) | **0.0** |
+| Timeout rate |  | 0.5 |
+
+Summary:
+- **Winner by composite score**: Enhanced (focused)
+- **Control failure mode**: timed out with machine-readable timeout payload (`async_wait_for_timeout`)
+- **Focused quality**: passed strict section contract + grounding checks with zero duplicate-create ratio
+
+### Key Findings
+1. The fail-fast timeout artifact path remains reliable under pressure (`ARAGORA_TIMEOUT_JSON` + timeout report file).
+2. Disabling context-init RLM limiter and upgrade loops is sufficient for at least one complete, high-quality run in this setup.
+3. Runtime asymmetry remains: control still times out while focused completes near the budget edge.
+4. The deterministic duplicate-create gate/repair is now in production code and behaves as expected on historical high-duplicate outputs.
+
+### Artifacts
+- `/tmp/dogfood_run008g/run008g_control_stdout.txt`
+- `/tmp/dogfood_run008g/run008g_control_stderr.txt`
+- `/tmp/dogfood_run008g/run008g_control_timeout.json`
+- `/tmp/dogfood_run008g/run008g_control_status.json`
+- `/tmp/dogfood_run008g/run008g_focused_stdout.txt`
+- `/tmp/dogfood_run008g/run008g_focused_stderr.txt`
+- `/tmp/dogfood_run008g/run008g_focused_status.json`
+- `/tmp/dogfood_run008g/run008g_summary.json`
+- `/tmp/dogfood_run008g/run008g_summary.md`
+
+### Gate Decision
+- **GO** for:
+  - deterministic duplicate-create enforcement in quality pipeline
+  - explicit `--no-context-init-rlm` runtime control in `ask`
+  - explorer timeout/cleanup hardening
+- **NO-GO** for declaring timeout stability solved globally; control still timed out in this run.
