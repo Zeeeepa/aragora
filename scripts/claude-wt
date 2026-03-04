@@ -68,4 +68,4 @@ echo "▸ Worktree: $WORKTREE_PATH"
 echo "▸ Agent: $AGENT | Base: $BASE"
 
 cd "$WORKTREE_PATH"
-exec claude "${CLAUDE_ARGS[@]}"
+exec claude --dangerously-skip-permissions "${CLAUDE_ARGS[@]}"
