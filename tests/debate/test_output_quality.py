@@ -9,6 +9,7 @@ from aragora.debate.output_quality import (
     apply_deterministic_quality_repairs,
     build_concretization_prompt,
     build_upgrade_prompt,
+    compute_duplicate_existing_create_ratio,
     derive_output_contract_from_task,
     finalize_json_payload,
     load_output_contract_from_file,
@@ -785,6 +786,104 @@ def test_derive_contract_short_without_context_stays_minimal():
     contract = derive_output_contract_from_task("Improve test coverage", has_context=False)
     assert contract is not None
     assert contract.required_sections == []
+
+
+def test_duplicate_existing_create_ratio_detected_as_hard_defect(tmp_path):
+    """Create/add/build targeting existing files should hard-fail quality."""
+    (tmp_path / "aragora" / "debate").mkdir(parents=True)
+    (tmp_path / "aragora" / "debate" / "output_quality.py").write_text("# existing", "utf-8")
+    (tmp_path / "tests" / "debate").mkdir(parents=True)
+    (tmp_path / "tests" / "debate" / "test_output_quality.py").write_text("# existing", "utf-8")
+
+    contract = OutputContract(
+        required_sections=[
+            "Ranked High-Level Tasks",
+            "Owner module / file paths",
+            "Test Plan",
+            "Rollback Plan",
+            "Gate Criteria",
+        ],
+        require_json_payload=False,
+    )
+    answer = """
+## Ranked High-Level Tasks
+- Create aragora/debate/output_quality.py support for duplicate-create checks.
+
+## Owner module / file paths
+- aragora/debate/output_quality.py
+
+## Test Plan
+- Run pytest tests/debate/test_output_quality.py -k duplicate
+
+## Rollback Plan
+If error_rate > 2% for 10m, rollback by disabling feature flag.
+
+## Gate Criteria
+- duplicate_existing_create_ratio <= 0.25
+- quality_score_10 >= 7.0
+"""
+    report = validate_output_against_contract(answer, contract, repo_root=str(tmp_path))
+    assert report.verdict == "needs_work"
+    assert report.duplicate_existing_create_ratio is not None
+    assert report.duplicate_existing_create_ratio > 0.25
+    assert any("Duplicate-create proposals target existing repo paths" in d for d in report.defects)
+
+
+def test_deterministic_repair_rewrites_duplicate_create_to_modify(tmp_path):
+    """Deterministic repair rewrites create/add/build phrasing against existing files."""
+    (tmp_path / "aragora" / "debate").mkdir(parents=True)
+    (tmp_path / "aragora" / "debate" / "quality_pipeline.py").write_text("# existing", "utf-8")
+    (tmp_path / "tests" / "debate").mkdir(parents=True)
+    (tmp_path / "tests" / "debate" / "test_quality_pipeline.py").write_text("# existing", "utf-8")
+
+    contract = OutputContract(
+        required_sections=[
+            "Ranked High-Level Tasks",
+            "Suggested Subtasks",
+            "Owner module / file paths",
+            "Test Plan",
+            "Rollback Plan",
+            "Gate Criteria",
+        ],
+        require_json_payload=False,
+    )
+    answer = """
+## Ranked High-Level Tasks
+- Create aragora/debate/quality_pipeline.py stronger post-consensus duplicate gates.
+
+## Suggested Subtasks
+- Add aragora/debate/quality_pipeline.py duplicate ratio checks for owner paths.
+- NEW FILE (justified): Create aragora/debate/new_duplicate_policy.py for policy docs.
+
+## Owner module / file paths
+- aragora/debate/quality_pipeline.py
+- tests/debate/test_quality_pipeline.py
+
+## Test Plan
+- Run pytest tests/debate/test_quality_pipeline.py -k duplicate
+
+## Rollback Plan
+If error_rate > 2% for 10m, rollback by disabling feature flag.
+
+## Gate Criteria
+- duplicate_existing_create_ratio <= 0.25
+- quality_score_10 >= 7.0
+"""
+    before = validate_output_against_contract(answer, contract, repo_root=str(tmp_path))
+    repaired = apply_deterministic_quality_repairs(
+        answer,
+        contract,
+        before,
+        repo_root=str(tmp_path),
+    )
+
+    assert "modify aragora/debate/quality_pipeline.py" in repaired.lower()
+    # Explicit NEW FILE marker should be preserved.
+    assert "NEW FILE (justified): Create aragora/debate/new_duplicate_policy.py" in repaired
+
+    ratio_after = compute_duplicate_existing_create_ratio(repaired, tmp_path)
+    # All existing-file create phrases should be rewritten; NEW FILE lines are ignored.
+    assert ratio_after is None or ratio_after <= 0.25
 
 
 # ---------------------------------------------------------------------------

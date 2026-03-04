@@ -5,19 +5,19 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from aragora.debate.output_quality import OutputContract, validate_output_against_contract
-from aragora.debate.repo_grounding import assess_repo_grounding, extract_repo_paths
+from aragora.debate.output_quality import (
+    OutputContract,
+    compute_duplicate_existing_create_ratio,
+    validate_output_against_contract,
+)
+from aragora.debate.repo_grounding import assess_repo_grounding
 
 
 TIMEOUT_PREFIX = "ARAGORA_TIMEOUT_JSON="
-CREATE_ACTION_RE = re.compile(
-    r"(?i)\b(create|add|build|scaffold|introduce|implement new|spin up)\b"
-)
 
 STANDARD_SECTIONS = [
     "Ranked High-Level Tasks",
@@ -100,29 +100,6 @@ def _extract_final_answer(stdout_text: str) -> str:
     return "\n".join(out_lines).strip()
 
 
-def _duplicate_existing_create_ratio(answer: str, repo_root: Path) -> float | None:
-    if not answer.strip():
-        return None
-
-    total_create_paths = 0
-    duplicate_existing = 0
-    for raw_line in answer.splitlines():
-        line = raw_line.strip()
-        if not line or not CREATE_ACTION_RE.search(line):
-            continue
-        paths = extract_repo_paths(line)
-        if not paths:
-            continue
-        for rel in paths:
-            total_create_paths += 1
-            if (repo_root / rel).exists():
-                duplicate_existing += 1
-
-    if total_create_paths == 0:
-        return None
-    return round(duplicate_existing / total_create_paths, 4)
-
-
 def _score_run(
     name: str,
     stdout_path: Path,
@@ -182,7 +159,7 @@ def _score_run(
     verified_ratio = (
         round(len(grounding.existing_paths) / total_paths, 4) if total_paths > 0 else 0.0
     )
-    duplicate_ratio = _duplicate_existing_create_ratio(final_answer, repo_root)
+    duplicate_ratio = compute_duplicate_existing_create_ratio(final_answer, repo_root)
 
     return RunMetrics(
         name=name,

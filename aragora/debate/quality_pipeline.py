@@ -202,7 +202,12 @@ def apply_post_consensus_quality(
 
     # Stage 2: deterministic repairs (if needed).
     if initial_report.verdict != "good":
-        repaired_answer = apply_deterministic_quality_repairs(answer, contract, initial_report)
+        repaired_answer = apply_deterministic_quality_repairs(
+            answer,
+            contract,
+            initial_report,
+            repo_root=repo_root,
+        )
         repaired_report = validate_output_against_contract(
             repaired_answer,
             contract,

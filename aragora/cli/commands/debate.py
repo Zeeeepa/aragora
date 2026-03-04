@@ -1745,6 +1745,7 @@ def cmd_ask(args: argparse.Namespace) -> None:
                 best_answer,
                 quality_contract,
                 best_report,
+                repo_root=repo_root,
             )
             deterministic_report = validate_output_against_contract(
                 deterministic_answer,

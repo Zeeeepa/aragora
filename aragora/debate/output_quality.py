@@ -48,6 +48,10 @@ _THRESHOLD_LINE_RE = re.compile(
 )
 _JSON_BLOCK_RE = re.compile(r"```json\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 _GENERIC_CODE_BLOCK_RE = re.compile(r"```\s*(.*?)```", re.DOTALL)
+_CREATE_ACTION_RE = re.compile(
+    r"(?i)\b(create|add|build|scaffold|introduce|implement\s+new|spin\s+up)\b"
+)
+_DUPLICATE_CREATE_MAX_RATIO = 0.25
 
 # Known template strings produced by _default_section_content().
 # Content matching these (after stripping) is filler, not real debate output.
@@ -212,6 +216,7 @@ class OutputQualityReport:
     has_rollback_trigger: bool
     has_paths: bool
     has_valid_json_payload: bool
+    duplicate_existing_create_ratio: float | None = None
     practicality_score_10: float = 0.0
     path_existence_rate: float = 0.0
     placeholder_rate: float = 0.0
@@ -233,6 +238,7 @@ class OutputQualityReport:
             "has_rollback_trigger": self.has_rollback_trigger,
             "has_paths": self.has_paths,
             "has_valid_json_payload": self.has_valid_json_payload,
+            "duplicate_existing_create_ratio": self.duplicate_existing_create_ratio,
             "practicality_score_10": self.practicality_score_10,
             "path_existence_rate": self.path_existence_rate,
             "placeholder_rate": self.placeholder_rate,
@@ -605,6 +611,48 @@ def _has_quantitative_thresholds(text: str) -> bool:
     return total_signals >= 1
 
 
+def compute_duplicate_existing_create_ratio(
+    answer: str,
+    repo_root: str | Path | None,
+) -> float | None:
+    """Return ratio of create-like actions targeting existing paths.
+
+    The metric mirrors dogfood scoring semantics:
+    - inspect only lines containing create-like verbs
+    - count referenced paths in those lines
+    - ratio = paths that already exist / total referenced paths
+    """
+    if not answer.strip() or repo_root is None:
+        return None
+
+    from aragora.debate.repo_grounding import extract_repo_paths
+
+    root = Path(repo_root)
+    total_create_paths = 0
+    duplicate_existing = 0
+
+    for raw_line in answer.splitlines():
+        line = raw_line.strip()
+        if not line or not _CREATE_ACTION_RE.search(line):
+            continue
+        # Explicit NEW FILE markers are allowed and should not be penalized.
+        if "new file" in line.lower():
+            continue
+
+        paths = extract_repo_paths(line)
+        if not paths:
+            continue
+
+        for rel in paths:
+            total_create_paths += 1
+            if (root / rel).exists():
+                duplicate_existing += 1
+
+    if total_create_paths == 0:
+        return None
+    return round(duplicate_existing / total_create_paths, 4)
+
+
 def validate_output_against_contract(
     answer: str,
     contract: OutputContract,
@@ -719,6 +767,10 @@ def validate_output_against_contract(
         repo_root=repo_root,
         require_owner_paths=contract.require_owner_paths,
     )
+    duplicate_existing_create_ratio = compute_duplicate_existing_create_ratio(
+        answer,
+        repo_root,
+    )
 
     if contract.require_gate_thresholds and not has_gate_thresholds:
         defects.append("Gate Criteria is missing explicit quantitative thresholds.")
@@ -734,6 +786,14 @@ def validate_output_against_contract(
     if contract.require_json_payload and not has_valid_json_payload:
         defects.append(
             "JSON Payload is invalid or missing." + (f" ({json_error})" if json_error else "")
+        )
+    if (
+        duplicate_existing_create_ratio is not None
+        and duplicate_existing_create_ratio > _DUPLICATE_CREATE_MAX_RATIO
+    ):
+        defects.append(
+            "Duplicate-create proposals target existing repo paths "
+            f"(ratio={duplicate_existing_create_ratio:.4f} > {_DUPLICATE_CREATE_MAX_RATIO:.2f})."
         )
 
     section_count = sum(1 for hit in section_hits.values() if hit)
@@ -787,6 +847,7 @@ def validate_output_against_contract(
         has_rollback_trigger=has_rollback_trigger,
         has_paths=has_paths,
         has_valid_json_payload=has_valid_json_payload,
+        duplicate_existing_create_ratio=duplicate_existing_create_ratio,
         practicality_score_10=grounding.practicality_score_10,
         path_existence_rate=grounding.path_existence_rate,
         placeholder_rate=grounding.placeholder_rate,
@@ -984,6 +1045,7 @@ def apply_deterministic_quality_repairs(
     answer: str,
     contract: OutputContract,
     report: OutputQualityReport,
+    repo_root: str | None = None,
 ) -> str:
     """Apply deterministic last-mile repairs for common structured-output defects.
 
@@ -997,6 +1059,12 @@ def apply_deterministic_quality_repairs(
     text = (answer or "").rstrip()
     if not text:
         return text
+
+    root_path: Path | None = None
+    if repo_root:
+        root_path = Path(repo_root)
+        text = _repair_duplicate_create_lines(text, root_path)
+        text = _repair_owner_paths(text, root_path)
 
     sections = _extract_sections(text)
     section_by_norm: dict[str, str] = {}
@@ -1102,6 +1170,52 @@ def _append_to_section(text: str, section_norm: str, suffix: str) -> str:
             insert_pos = section["end"]
             return text[:insert_pos].rstrip() + suffix + "\n" + text[insert_pos:]
     return text
+
+
+def _repair_duplicate_create_lines(text: str, repo_root: Path) -> str:
+    """Rewrite create/add/build phrasing to modify when target paths already exist."""
+    from aragora.debate.repo_grounding import extract_repo_paths
+
+    if not text.strip():
+        return text
+
+    def _replacement(match: re.Match[str]) -> str:
+        value = match.group(0)
+        if value and value[0].isupper():
+            return "Modify"
+        return "modify"
+
+    out_lines: list[str] = []
+    changed = False
+    for raw_line in text.splitlines():
+        line = raw_line
+        stripped = line.strip()
+        if not stripped or "new file" in stripped.lower() or not _CREATE_ACTION_RE.search(line):
+            out_lines.append(line)
+            continue
+
+        paths = extract_repo_paths(line)
+        if not paths:
+            out_lines.append(line)
+            continue
+
+        if not any((repo_root / rel).exists() for rel in paths):
+            out_lines.append(line)
+            continue
+
+        updated = re.sub(r"(?i)\bimplement\s+new\b", _replacement, line)
+        updated = re.sub(
+            r"(?i)\b(spin\s+up|create|add|build|scaffold|introduce)\b",
+            _replacement,
+            updated,
+        )
+        if updated != line:
+            changed = True
+        out_lines.append(updated)
+
+    if not changed:
+        return text
+    return "\n".join(out_lines)
 
 
 # ---------------------------------------------------------------------------
