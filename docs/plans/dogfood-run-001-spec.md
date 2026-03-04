@@ -756,3 +756,69 @@ Summary:
   - explicit `--no-context-init-rlm` runtime control in `ask`
   - explorer timeout/cleanup hardening
 - **NO-GO** for declaring timeout stability solved globally; control still timed out in this run.
+
+---
+
+## Dogfood Run 008h Results (Timeout Doubled to 480s)
+
+### Date
+- 2026-03-04
+
+### Goal
+- Validate whether doubling benchmark timeout from `240s` to `480s` eliminates timeout-driven A/B invalidation under the same runtime profile.
+
+### Configuration
+- **Team**: 3 agents via OpenRouter (`claude-sonnet-4` proposer, `gpt-4o` critic, `gemini-2.0-flash-001` synthesizer)
+- **Rounds**: 1
+- **Consensus**: majority
+- **Runtime controls**:
+  - `--no-context-init-rlm`
+  - `--no-upgrade-to-good`
+  - `--quality-concretize-max-rounds 0`
+  - `--quality-extra-assessment-rounds 0`
+  - `--timeout 480` (**doubled from 240**)
+- **Context mode**:
+  - `--codebase-context --codebase-context-path <repo>`
+  - no harness explorers in this benchmark leg
+
+### Execution Results
+
+| Variant | Exit | Duration | Final answer present | Timeout report |
+|---|---:|---:|---:|---:|
+| Control | 0 | 259.785s | Yes | No |
+| Focused | 0 | 232.763s | Yes | No |
+
+### Objective Score (`scripts/dogfood_score.py`)
+
+| Metric | Baseline (Control) | Enhanced (Focused) |
+|---|---:|---:|
+| Composite score | **0.6150** | 0.5414 |
+| Quality score | **9.0** | 8.0 |
+| Practicality score | 6.56 | **6.57** |
+| Verified existing path ratio | **0.1538** | 0.0 |
+| Duplicate existing create-ratio | N/A | **0.0** |
+| Timeout rate |  | **0.0** |
+
+Summary:
+- **Winner by composite score**: Baseline (control)
+- **Timeout impact**: doubling timeout removed timeout failures in this run (`timeout_rate` dropped from 0.5 in run-008g to 0.0 in run-008h).
+
+### Key Findings
+1. Doubling timeout to `480s` materially improved benchmark reliability (both legs completed with final answers).
+2. Runtime reliability gain did not automatically improve focused-output quality; focused output regressed on structure/path grounding in this sample.
+3. Duplicate-create suppression remained strong in focused output (`0.0`), but grounding/path specificity dropped, indicating over-correction.
+4. New timeout default is justified for benchmark validity; prompt/contract tuning is still required for focused variant quality consistency.
+
+### Artifacts
+- `/tmp/dogfood_run008h/run008h_control_stdout.txt`
+- `/tmp/dogfood_run008h/run008h_control_stderr.txt`
+- `/tmp/dogfood_run008h/run008h_control_status.json`
+- `/tmp/dogfood_run008h/run008h_focused_stdout.txt`
+- `/tmp/dogfood_run008h/run008h_focused_stderr.txt`
+- `/tmp/dogfood_run008h/run008h_focused_status.json`
+- `/tmp/dogfood_run008h/run008h_summary.json`
+- `/tmp/dogfood_run008h/run008h_summary.md`
+
+### Gate Decision
+- **GO** to adopt `--timeout 480` as the benchmark default for this run class.
+- **NO-GO** on focused prompt contract until path-grounding/section regressions are corrected.
