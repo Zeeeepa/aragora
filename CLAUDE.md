@@ -108,7 +108,7 @@ Aragora is the **Decision Integrity Platform** -- orchestrating 43 agent types t
 
 **Five Pillars:** (1) SMB-ready with enterprise-grade security, (2) leading-edge memory and context processing, (3) extensible/modular with broad connectors and SDKs, (4) multi-agent robustness via heterogeneous model consensus, (5) self-healing and self-extending via the Nomic Loop.
 
-**Codebase Scale:** 3,000+ Python modules | 208,000+ tests | 4,000+ test files | 210+ debate modules | 3,000+ API operations across 2,900+ paths | 0 KM adapters | 185 SDK namespaces
+**Codebase Scale:** 3,000+ Python modules | 208,000+ tests | 4,000+ test files | 210+ debate modules | 3,000+ API operations across 2,900+ paths | 41 KM adapters | 185 SDK namespaces
 
 ## Architecture
 
@@ -140,7 +140,7 @@ aragora/
 ├── knowledge/        # Unified knowledge management
 │   ├── bridges.py          # KnowledgeBridgeHub, MetaLearner, Evidence bridges
 │   └── mound/              # KnowledgeMound with sync, revalidation
-│       └── adapters/       # KM adapters (34 registered)
+│       └── adapters/       # KM adapters (41 registered)
 │           └── factory.py  # Auto-create adapters from Arena subsystems
 ├── connectors/       # External integrations
 │   ├── chat/               # Telegram, WhatsApp connectors
@@ -417,7 +417,7 @@ See `docs/reference/ENVIRONMENT.md` for full reference.
 
 **Integrated:**
 - Knowledge Mound - STABLE Phase A2 (100% integrated, 4,300+ tests passing)
-  - 34 adapters (Continuum, Consensus, Critique, Evidence, Belief, Insights, ELO, Performance, Pulse, Cost, Provenance, Fabric, Workspace, ComputerUse, Gateway, CalibrationFusion, ControlPlane, Culture, Receipt, DecisionPlan, Supermemory, RLM, Trickster, ERC8004, Obsidian, Debate, Workflow, Compliance, LangExtract, Extraction, NomicCycle, Ranking, OpenClaw, ClaudeMem)
+  - 41 adapters (Belief, CalibrationFusion, ClaudeMem, Codebase, Compliance, ComputerUse, Confluence, Consensus, Continuum, ControlPlane, Cost, Critique, Culture, Debate, DecisionPlan, ELO, Email, ERC8004, Evidence, Explainability, Fabric, Gateway, Genesis, GoalCanvas, IdeaCanvas, Insights, Jira, LangExtract, Obsidian, Outcome, Performance, Pipeline, Provenance, Pulse, Receipt, RLM, RLMContext, Supermemory, Trickster, Workflow, Workspace)
   - Visibility, sharing, federation, global knowledge
   - Semantic search, validation feedback, cross-debate learning
   - SLO alerting with Prometheus metrics
