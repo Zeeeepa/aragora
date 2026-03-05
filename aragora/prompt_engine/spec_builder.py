@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any
 
 from aragora.prompt_engine.decomposer import PromptDecomposer
@@ -111,11 +112,16 @@ class SpecBuilder:
 
         research_text = ""
         if research:
+            current = str(research.current_state)[:500] if research.current_state else ""
+            recs = ", ".join(str(r) for r in (research.recommendations or [])[:5])
+            competitive = (
+                str(research.competitive_analysis)[:300] if research.competitive_analysis else ""
+            )
             research_text = (
                 f"Research findings:\n"
-                f"Current state: {research.current_state[:500]}\n"
-                f"Recommendations: {', '.join(research.recommendations[:5])}\n"
-                f"Competitive: {research.competitive_analysis[:300]}"
+                f"Current state: {current}\n"
+                f"Recommendations: {recs}\n"
+                f"Competitive: {competitive}"
             )
 
         prompt = _SPEC_PROMPT.format(
@@ -147,25 +153,21 @@ class SpecBuilder:
     def _parse_spec(self, response: str) -> Specification:
         """Parse LLM response into a Specification."""
         text = response.strip()
-        if text.startswith("```"):
-            text = text.split("\n", 1)[1] if "\n" in text else text[3:]
-        if text.endswith("```"):
-            text = text[:-3]
-        text = text.strip()
 
-        try:
-            data = json.loads(text)
-        except json.JSONDecodeError:
-            start = text.find("{")
-            end = text.rfind("}") + 1
-            if start >= 0 and end > start:
-                try:
-                    data = json.loads(text[start:end])
-                except json.JSONDecodeError:
-                    logger.warning("Could not parse spec response")
-                    return self._fallback_spec(text)
-            else:
-                return self._fallback_spec(text)
+        # Strip markdown code fences (```json ... ``` or ``` ... ```)
+        fence_match = re.search(r"```(?:json)?\s*\n(.*?)```", text, re.DOTALL)
+        if fence_match:
+            text = fence_match.group(1).strip()
+        else:
+            if text.startswith("```"):
+                text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+            if text.endswith("```"):
+                text = text[:-3]
+            text = text.strip()
+
+        data = self._extract_json(text)
+        if data is None:
+            return self._fallback_spec(text)
 
         try:
             file_changes = [
@@ -212,6 +214,101 @@ class SpecBuilder:
         except (KeyError, TypeError, ValueError) as e:
             logger.warning("Error building Specification: %s", e)
             return self._fallback_spec(text)
+
+    @staticmethod
+    def _extract_json(text: str) -> dict[str, Any] | None:
+        """Try multiple strategies to extract JSON from LLM response."""
+        # Strategy 1: direct parse
+        try:
+            data = json.loads(text)
+            return SpecBuilder._unwrap_nested(data)
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        # Strategy 2: find outermost { ... } using brace balancing
+        start = text.find("{")
+        if start < 0:
+            return None
+
+        depth = 0
+        in_string = False
+        escape_next = False
+        for i in range(start, len(text)):
+            c = text[i]
+            if escape_next:
+                escape_next = False
+                continue
+            if c == "\\":
+                escape_next = True
+                continue
+            if c == '"' and not escape_next:
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        data = json.loads(text[start : i + 1])
+                        return SpecBuilder._unwrap_nested(data)
+                    except (json.JSONDecodeError, ValueError):
+                        return None
+
+        # Strategy 3: fallback to rfind
+        end = text.rfind("}") + 1
+        if start >= 0 and end > start:
+            try:
+                data = json.loads(text[start:end])
+                return SpecBuilder._unwrap_nested(data)
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+        # Strategy 4: repair truncated JSON by closing open structures
+        repaired = SpecBuilder._repair_truncated_json(text[start:])
+        if repaired is not None:
+            return SpecBuilder._unwrap_nested(repaired)
+
+        return None
+
+    @staticmethod
+    def _unwrap_nested(data: dict[str, Any]) -> dict[str, Any]:
+        """Unwrap LLM responses that nest the spec inside a wrapper key."""
+        if not isinstance(data, dict):
+            return data
+        # If the dict has a single key containing a nested dict with spec fields, unwrap
+        if len(data) == 1:
+            key = next(iter(data))
+            inner = data[key]
+            if isinstance(inner, dict) and ("title" in inner or "problem_statement" in inner):
+                return inner
+        return data
+
+    @staticmethod
+    def _repair_truncated_json(text: str) -> dict[str, Any] | None:
+        """Attempt to repair truncated JSON by closing open structures."""
+        if not text or not text.lstrip().startswith("{"):
+            return None
+
+        # Find the last valid position by trying progressively shorter substrings
+        # ending at the last complete value boundary
+        last_good = text.rfind("}")
+        while last_good > 0:
+            candidate = text[: last_good + 1]
+            # Close any remaining open braces
+            open_braces = candidate.count("{") - candidate.count("}")
+            open_brackets = candidate.count("[") - candidate.count("]")
+            if open_braces >= 0 and open_brackets >= 0:
+                repaired = candidate + "]" * open_brackets + "}" * open_braces
+                try:
+                    return json.loads(repaired)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+            last_good = text.rfind("}", 0, last_good)
+
+        return None
 
     @staticmethod
     def _fallback_spec(raw_text: str) -> Specification:
