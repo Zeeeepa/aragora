@@ -423,10 +423,17 @@ export class UnifiedInboxAPI {
     message_id: string;
     status: string;
   }> {
+    if (!request || Object.keys(request).length === 0) {
+      return this.client.request(
+        'POST',
+        `/api/v1/inbox/messages/${encodeURIComponent(messageId)}/debate`
+      );
+    }
+
     return this.client.request(
       'POST',
       `/api/v1/inbox/messages/${encodeURIComponent(messageId)}/debate`,
-      { json: request ?? {} }
+      { json: request }
     );
   }
 

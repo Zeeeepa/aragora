@@ -67,6 +67,10 @@ The server metrics module emits gate telemetry for dashboarding:
 Prebuilt Grafana dashboard:
 - `deploy/grafana/dashboards/execution-safety-gate.json`
 
+Prometheus alert rules for this metric family:
+- `deploy/alerting/prometheus-rules.yml` (`ExecutionGateDenySpike`, `ExecutionGateReceiptVerificationFailures`)
+- `deploy/monitoring/alerts.yaml` (`AragoraExecutionGateDenySpike`, `AragoraExecutionGateReceiptVerificationFailures`)
+
 Useful PromQL panels:
 
 ```promql
