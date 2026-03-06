@@ -48,20 +48,25 @@ runs:
           exit 1
         fi
 
-        sudo ln -sf "${PY_BIN}" /usr/local/bin/python
-        sudo ln -sf "${PY_BIN}" /usr/local/bin/python3
+        LOCAL_BIN="${RUNNER_TEMP:-$HOME}/setup-python-safe-bin"
+        mkdir -p "${LOCAL_BIN}"
+        ln -sf "${PY_BIN}" "${LOCAL_BIN}/python"
+        ln -sf "${PY_BIN}" "${LOCAL_BIN}/python3"
 
         # Make pip reliably available on self-hosted runners even when
         # actions/setup-python fails and no pip shim is on PATH.
-        /usr/local/bin/python -m ensurepip --upgrade || true
-        /usr/local/bin/python -m pip --version
+        "${LOCAL_BIN}/python" -m ensurepip --upgrade || true
+        "${LOCAL_BIN}/python" -m pip --version
 
-        cat <<'EOF' | sudo tee /usr/local/bin/pip >/dev/null
+        cat <<'EOF' > "${LOCAL_BIN}/pip"
         #!/usr/bin/env bash
-        exec /usr/local/bin/python -m pip "$@"
+        exec python -m pip "$@"
         EOF
-        sudo chmod +x /usr/local/bin/pip
-        sudo ln -sf /usr/local/bin/pip /usr/local/bin/pip3
+        chmod +x "${LOCAL_BIN}/pip"
+        ln -sf "${LOCAL_BIN}/pip" "${LOCAL_BIN}/pip3"
+
+        echo "${LOCAL_BIN}" >> "${GITHUB_PATH}"
+        export PATH="${LOCAL_BIN}:${PATH}"
 
         python --version
-        pip --version || /usr/local/bin/python -m pip --version
+        python -m pip --version

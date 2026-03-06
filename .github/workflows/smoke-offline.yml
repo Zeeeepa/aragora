@@ -62,7 +62,7 @@ jobs:
 
       - name: Run offline golden-path unit tests
         run: |
-          pytest tests/cli/test_offline_golden_path.py -v --timeout=60 --tb=short \
+          python -m pytest tests/cli/test_offline_golden_path.py -v --timeout=60 --tb=short \
             -W error::ResourceWarning \
             -W error::pytest.PytestUnraisableExceptionWarning
         env:

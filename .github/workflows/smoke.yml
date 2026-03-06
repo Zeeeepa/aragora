@@ -123,7 +123,7 @@ jobs:
 
       - name: Verify offline/demo behavior tests
         run: |
-          pytest tests/cli/test_offline_golden_path.py -v --timeout=60 --tb=short \
+          python -m pytest tests/cli/test_offline_golden_path.py -v --timeout=60 --tb=short \
             -W error::ResourceWarning \
             -W error::pytest.PytestUnraisableExceptionWarning
         env:
@@ -180,7 +180,7 @@ jobs:
 
       - name: Run server smoke tests
         run: |
-          pytest tests/e2e/test_server_smoke.py -v --timeout=120 --tb=short
+          python -m pytest tests/e2e/test_server_smoke.py -v --timeout=120 --tb=short
         env:
           PYTHONPATH: .
           ARAGORA_CI: "true"
@@ -244,7 +244,7 @@ jobs:
           PYTHONPATH: .
           DECISION_ACTION_SMOKE_ARTIFACT_DIR: test-results/decision-action-smoke
         run: |
-          pytest tests/e2e/test_decision_action_smoke.py -v --tb=short --timeout=120
+          python -m pytest tests/e2e/test_decision_action_smoke.py -v --tb=short --timeout=120
 
       - name: Upload decision-to-action smoke artifacts
         if: always()
