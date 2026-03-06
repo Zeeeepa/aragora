@@ -322,15 +322,43 @@ class MFADriftMonitor:
                 break
 
     def _list_users(self) -> list[Any]:
-        """List users from the store; tries list_users then get_all_users."""
-        list_fn = getattr(self._user_store, "list_users", None) or getattr(
-            self._user_store, "get_all_users", None
-        )
-        if list_fn is None:
-            logger.warning("MFADriftMonitor: user_store has no list_users / get_all_users method")
-            return []
+        """List users from the store, supporting paginated admin stores."""
         try:
-            return list(list_fn())
+            list_all_fn = getattr(self._user_store, "list_all_users", None)
+            if callable(list_all_fn):
+                limit = 1000
+                offset = 0
+                users: list[Any] = []
+                while True:
+                    batch_result = list_all_fn(limit=limit, offset=offset)
+                    if isinstance(batch_result, tuple) and len(batch_result) == 2:
+                        batch, total = batch_result
+                    else:
+                        batch, total = batch_result, None
+                    batch_users = list(batch)
+                    users.extend(batch_users)
+                    if not batch_users:
+                        break
+                    if total is not None and len(users) >= int(total):
+                        break
+                    if total is None and len(batch_users) < limit:
+                        break
+                    offset += limit
+                return users
+
+            list_fn = getattr(self._user_store, "list_users", None) or getattr(
+                self._user_store, "get_all_users", None
+            )
+            if list_fn is None:
+                logger.warning(
+                    "MFADriftMonitor: user_store has no list_all_users / list_users / get_all_users method"
+                )
+                return []
+
+            result = list_fn()
+            if isinstance(result, tuple) and len(result) == 2:
+                result, _ = result
+            return list(result)
         except (RuntimeError, ValueError, TypeError, AttributeError) as exc:
             logger.warning("MFADriftMonitor: failed to list users: %s", exc)
             return []

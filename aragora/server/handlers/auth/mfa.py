@@ -38,6 +38,40 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def _enumerate_users_for_compliance(user_store) -> list:
+    """Return all users from the supported auth store interfaces."""
+    list_all_fn = getattr(user_store, "list_all_users", None)
+    if callable(list_all_fn):
+        limit = 1000
+        offset = 0
+        users = []
+        while True:
+            batch_result = list_all_fn(limit=limit, offset=offset)
+            if isinstance(batch_result, tuple) and len(batch_result) == 2:
+                batch, total = batch_result
+            else:
+                batch, total = batch_result, None
+            batch_users = list(batch)
+            users.extend(batch_users)
+            if not batch_users:
+                break
+            if total is not None and len(users) >= int(total):
+                break
+            if total is None and len(batch_users) < limit:
+                break
+            offset += limit
+        return users
+
+    list_fn = getattr(user_store, "list_users", None) or getattr(user_store, "get_all_users", None)
+    if list_fn is None:
+        raise AttributeError("User store does not support listing users")
+
+    result = list_fn()
+    if isinstance(result, tuple) and len(result) == 2:
+        result, _ = result
+    return list(result)
+
+
 def extract_user_from_request(handler, user_store):
     """Proxy extract_user_from_request for patching in tests without circular imports."""
     from . import handler as auth_handler_module
@@ -598,13 +632,10 @@ def handle_mfa_compliance(handler_instance: "AuthHandler", handler) -> HandlerRe
     if not user_store:
         return error_response("User service unavailable", 503)
 
-    # Get all users from store
-    list_fn = getattr(user_store, "list_users", None) or getattr(user_store, "get_all_users", None)
-    if list_fn is None:
-        return error_response("User store does not support listing users", 501)
-
     try:
-        all_users = list(list_fn())
+        all_users = _enumerate_users_for_compliance(user_store)
+    except AttributeError:
+        return error_response("User store does not support listing users", 501)
     except (RuntimeError, ValueError, TypeError, AttributeError):
         return error_response("Failed to list users", 500)
 

@@ -71,10 +71,17 @@ class _MultiRoleAdmin:
 # ---------------------------------------------------------------------------
 
 
-def _make_handler_instance(users: list, permission_allowed: bool = True):
+def _make_handler_instance(
+    users: list,
+    permission_allowed: bool = True,
+    listing_mode: str = "list_users",
+):
     """Create a mock AuthHandler with a fake user store."""
-    store = MagicMock()
-    store.list_users.return_value = users
+    store = MagicMock(spec=[listing_mode])
+    if listing_mode == "list_all_users":
+        store.list_all_users.return_value = (users, len(users))
+    else:
+        store.list_users.return_value = users
 
     instance = MagicMock()
     instance._get_user_store.return_value = store
@@ -235,6 +242,25 @@ class TestMFAComplianceNoAdmins:
         assert body["mfa_disabled_count"] == 0
         assert body["compliance_pct"] == 100.0
         assert body["non_compliant_users"] == []
+
+
+class TestMFAComplianceStoreCompatibility:
+    """Support the standard paginated user-store API."""
+
+    def test_list_all_users_tuple_is_supported(self):
+        admin = _AdminUser(id="a1", mfa_enabled=True)
+        member = _RegularUser(id="u1")
+        instance = _make_handler_instance(
+            [admin, member],
+            listing_mode="list_all_users",
+        )
+
+        result = handle_mfa_compliance(instance, MagicMock())
+        body, status = _parse_result(result)
+
+        assert status == 200
+        assert body["total_admins"] == 1
+        assert body["mfa_enabled_count"] == 1
 
 
 class TestMFAComplianceMultiRole:
