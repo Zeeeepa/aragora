@@ -50,6 +50,7 @@ export function HeroSection(props: Partial<HeroSectionProps> & Record<string, un
   const [error, setError] = useState<string | null>(null);
   const [phaseIndex, setPhaseIndex] = useState(0);
   const [elapsed, setElapsed] = useState(0);
+  const [shareCopied, setShareCopied] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
   const startTimeRef = useRef<number>(0);
 
@@ -241,7 +242,12 @@ export function HeroSection(props: Partial<HeroSectionProps> & Record<string, un
       )}
 
       <div className="max-w-xl mx-auto text-center w-full">
-        {/* ASCII banner — dark theme only */}
+        {/* Mobile-only brand text (ASCII banner is hidden on small screens) */}
+        <div className="block sm:hidden text-center mb-4">
+          <span className="text-[var(--acid-green)] font-mono font-bold text-2xl tracking-[0.3em]">ARAGORA</span>
+        </div>
+
+        {/* ASCII banner — dark theme only, desktop */}
         {isDark && (
           <pre
             className="text-[6px] sm:text-[7px] text-center mb-10 hidden sm:block leading-tight"
@@ -492,6 +498,54 @@ export function HeroSection(props: Partial<HeroSectionProps> & Record<string, un
 
         {/* Result preview */}
         {result && <DebateResultPreview result={result} />}
+
+        {/* Post-debate CTAs — 2 focused actions */}
+        {result && (
+          <div className="flex gap-3 mt-6 max-w-xl mx-auto">
+            <button
+              onClick={() => { setResult(null); setQuestion(''); setError(null); }}
+              className="flex-1 text-sm font-bold font-mono py-3 transition-all hover:opacity-90 cursor-pointer"
+              style={{
+                backgroundColor: 'var(--accent)',
+                color: 'var(--bg)',
+                borderRadius: 'var(--radius-button)',
+              }}
+            >
+              Try Another
+            </button>
+            <button
+              onClick={async () => {
+                const shareUrl = result.id
+                  ? `${window.location.origin}/debate/${result.id}`
+                  : window.location.href;
+                try {
+                  await navigator.clipboard.writeText(shareUrl);
+                } catch {
+                  const ta = document.createElement('textarea');
+                  ta.value = shareUrl;
+                  ta.style.position = 'fixed';
+                  ta.style.opacity = '0';
+                  document.body.appendChild(ta);
+                  ta.select();
+                  document.execCommand('copy');
+                  document.body.removeChild(ta);
+                }
+                setShareCopied(true);
+                setTimeout(() => setShareCopied(false), 2000);
+              }}
+              className="flex-1 text-sm font-bold font-mono py-3 transition-all hover:opacity-80 cursor-pointer"
+              style={{
+                backgroundColor: 'transparent',
+                color: 'var(--accent)',
+                border: '1px solid var(--accent)',
+                borderRadius: 'var(--radius-button)',
+                opacity: shareCopied ? 0.7 : 1,
+              }}
+            >
+              {shareCopied ? 'Copied!' : 'Share'}
+            </button>
+          </div>
+        )}
       </div>
     </section>
   );
