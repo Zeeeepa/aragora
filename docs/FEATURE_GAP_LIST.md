@@ -19,6 +19,7 @@
 | Feature | Status | Notes |
 |---------|--------|-------|
 | External penetration test | Vendor outreach in progress | Kickoff target: Mar 3, 2026. Only remaining external blocker. |
+| Debate output quality | **VALIDATED — 100% pass rate** | Run 012 (Mar 5): composite 8.38-9.39/10. Diverse benchmark (10 domains): 100% pass, avg composite 0.938. Move to Completed next update. |
 
 ---
 
@@ -26,12 +27,12 @@
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| 3 beta users with `aragora review` | **PR watch daemon built** | Autonomous daemon polls repos for PRs and runs multi-agent review (PR #663). Deploy on spare machines for non-human "beta users". |
+| Agent-first beta via PR watch daemon | **Daemon built (PR #663)** | `aragora openclaw watch` polls repos, runs multi-agent review, posts findings. Systemd service + env template included. Deploy on spare machines for autonomous agent "beta users". |
 | GitHub Actions pre-merge gate | **Workflow created** | `aragora-review-gate.yml` manual-only (workflow_dispatch). Re-enable pull_request trigger when ready. |
-| Public demo at aragora.ai/demo | **Frontend complete** | `/demo` (pipeline), `/demo/instant` (debate replay), share URLs all working. Landing page links to demo. Needs production deployment verification. |
-| EU AI Act compliance package | **Substantially complete** | Art. 9/12/13/14/15 dedicated bundles + CLI export + compliance scoring + demo script. Customer playbook needed. **Deadline: Aug 2, 2026.** |
+| Public demo at aragora.ai/demo | **Live and verified** | `/demo` (pipeline), `/demo/instant` (debate replay), share URLs, landing page all return 200. API playground healthy. |
+| EU AI Act compliance package | **Substantially complete** | Art. 9/12/13/14/15 dedicated bundles + CLI export + compliance scoring + demo script + customer playbook. **Deadline: Aug 2, 2026.** |
 | First 2 enterprise pilot engagements | Not started | Closed partnerships — target fintech + healthcare |
-| Developer onboarding <10 min | **Working (2-5 min)** | `aragora quickstart --demo` (zero-config), `aragora review --demo`, Docker quickstart all work. Needs cold-start user testing to validate. |
+| Developer onboarding <10 min | **Working (2-5 min)** | `aragora quickstart --demo` (zero-config), `aragora review --demo`, Docker quickstart all verified working. Needs cold-start user testing. |
 
 ---
 
@@ -45,7 +46,7 @@
 | Decision-Integrity UI Workbench | Not started | No frontend for knowledge search, agent leaderboard, pipeline canvas. Backend APIs complete. |
 | SOC 2 Type II audit engagement | Not started | 98% controls implemented; formal audit vendor not engaged. |
 | Smart provider routing | Not started | Cost/quality-optimized routing across Claude/GPT/Mistral/DeepSeek. |
-| OpenClaw → Aragora PR review integration | **Complete** | `PRWatchDaemon` in `aragora/compat/openclaw/pr_watch_daemon.py`. CLI: `aragora openclaw watch`. Systemd service + env template. |
+| Enterprise Communication Hub (#293) | **~55%** | Delivery log + retry queue + circuit breakers + event telemetry wired. Remaining: notification templates, user preferences, inbox→debate trigger, Active Triage dashboard. |
 
 ---
 
@@ -91,7 +92,7 @@
 
 | Feature | Current State | Gap |
 |---------|---------------|-----|
-| Self-improving platform quality | Nomic Loop 100% wired; 66 E2E tests; pipeline hardened (live async default, quality gate, bidirectional handoff) | Production-scale validation; cross-cycle learning feedback |
+| Self-improving platform quality | Nomic Loop 100% wired; 82 E2E tests; pipeline hardened (PRs #650, #649, #659 merged); safety gates + gauntlet gate + evolution audit | Diverse benchmark validated (100% pass). Production safety gate requires ENABLE_NOMIC_LOOP=true. |
 | Blockchain receipts | SHA-256 cryptographic hashing works | On-chain storage with ERC-8004 (not deployed) |
 | Semantic convergence | Embedding detection wired (sentence-transformers) | Not default; some debate paths still use difflib |
 | OpenClaw execution | Computer use detection works | Production E2E flow (debate → computer use → receipt) not validated |
@@ -116,8 +117,9 @@ These items were planned and are now shipped:
 | Compliance CLI (EU AI Act artifact export) | Mar 2026 |
 | Settlement hooks | Mar 2026 |
 | Gauntlet receipts (SHA-256 audit trails) | Feb 2026 |
-| Debate output quality (80%+ diverse pass rate) | Mar 2026 |
 | Article 9 dedicated artifact bundle | Mar 2026 |
-| CI setup-python-safe (51 workflows) | Mar 2026 |
+| Debate output quality (10-domain benchmark) | Mar 2026 |
+| Nomic Loop safety gates (production gate, gauntlet, audit) | Mar 2026 |
+| CI setup-python-safe composite action (51 workflows) | Mar 2026 |
 | CI push-to-main noise reduction (35→6 workflows) | Mar 2026 |
-| Self-hosted runner fleet (9 runners) | Mar 2026 |
+| Self-hosted runner fleet (12 runners: 3 Hetzner + 6 EC2 + 3 Mac) | Mar 2026 |
