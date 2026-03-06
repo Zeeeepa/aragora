@@ -134,7 +134,7 @@ jobs:
           ARAGORA_OFFLINE: "1"
           PYTHONWARNINGS: "error::ResourceWarning"
         run: |
-          aragora ask "Offline mode smoke" --demo --rounds 1
+          python -m aragora.cli.main ask "Offline mode smoke" --demo --rounds 1
 
   server-smoke:
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft

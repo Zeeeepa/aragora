@@ -68,5 +68,5 @@ runs:
         echo "${LOCAL_BIN}" >> "${GITHUB_PATH}"
         export PATH="${LOCAL_BIN}:${PATH}"
 
-        python --version
-        python -m pip --version
+        "${LOCAL_BIN}/python" --version
+        "${LOCAL_BIN}/python" -m pip --version
