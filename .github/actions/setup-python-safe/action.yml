@@ -50,17 +50,21 @@ runs:
 
         LOCAL_BIN="${RUNNER_TEMP:-$HOME}/setup-python-safe-bin"
         mkdir -p "${LOCAL_BIN}"
-        ln -sf "${PY_BIN}" "${LOCAL_BIN}/python"
-        ln -sf "${PY_BIN}" "${LOCAL_BIN}/python3"
+        cat > "${LOCAL_BIN}/python" <<EOF
+        #!/usr/bin/env bash
+        exec "${PY_BIN}" "\$@"
+        EOF
+        chmod +x "${LOCAL_BIN}/python"
+        ln -sf "${LOCAL_BIN}/python" "${LOCAL_BIN}/python3"
 
         # Make pip reliably available on self-hosted runners even when
         # actions/setup-python fails and no pip shim is on PATH.
         "${LOCAL_BIN}/python" -m ensurepip --upgrade || true
         "${LOCAL_BIN}/python" -m pip --version
 
-        cat <<'EOF' > "${LOCAL_BIN}/pip"
+        cat > "${LOCAL_BIN}/pip" <<EOF
         #!/usr/bin/env bash
-        exec python -m pip "$@"
+        exec "${PY_BIN}" -m pip "\$@"
         EOF
         chmod +x "${LOCAL_BIN}/pip"
         ln -sf "${LOCAL_BIN}/pip" "${LOCAL_BIN}/pip3"
