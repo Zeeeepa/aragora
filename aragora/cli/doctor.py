@@ -17,6 +17,8 @@ import os
 import sys
 from pathlib import Path
 
+from aragora.config.provider_readiness import discover_provider_credentials
+
 
 def check_icon(ok: bool | None) -> str:
     """Return status icon."""
@@ -35,7 +37,7 @@ def print_section(title: str) -> None:
 
 def check_packages() -> list[tuple[str, str, bool | None]]:
     """Check required and optional packages."""
-    checks = []
+    checks: list[tuple[str, str, bool | None]] = []
 
     # Required packages
     required = ["aiohttp", "pydantic", "sqlite3", "asyncio"]
@@ -69,35 +71,31 @@ def check_packages() -> list[tuple[str, str, bool | None]]:
 
 def check_api_keys() -> list[tuple[str, str, bool | None]]:
     """Check API key configuration."""
-    checks = []
+    checks: list[tuple[str, str, bool | None]] = []
+    report = discover_provider_credentials()
 
-    # At least one LLM provider required
-    llm_keys = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]
-    has_llm = False
-    for key in llm_keys:
-        if os.getenv(key):
-            checks.append((key, "configured", True))
-            has_llm = True
+    for provider in report.providers:
+        env_label = "/".join(provider.checked_env_vars)
+        if provider.configured:
+            checks.append((env_label, "configured", True))
         else:
-            checks.append((key, "not set", None))
+            checks.append((env_label, "not set", None))
 
-    if not has_llm:
-        checks.append(("LLM Provider", "NO API KEY SET", False))
-
-    # Optional providers
-    optional_keys = ["GEMINI_API_KEY", "MISTRAL_API_KEY", "OPENROUTER_API_KEY"]
-    for key in optional_keys:
-        if os.getenv(key):
-            checks.append((key, "configured", True))
-        else:
-            checks.append((key, "not set", None))
+    if report.any_configured:
+        configured = ", ".join(report.configured_providers)
+        checks.append(("LLM Provider", f"configured: {configured}", True))
+    else:
+        detail = "NO API KEY SET"
+        if report.discovery_errors:
+            detail += f" ({'; '.join(report.discovery_errors)})"
+        checks.append(("LLM Provider", detail, False))
 
     return checks
 
 
 def check_storage() -> list[tuple[str, str, bool | None]]:
     """Check storage backends."""
-    checks = []
+    checks: list[tuple[str, str, bool | None]] = []
 
     # Check data directory
     data_dir = Path.home() / ".aragora"
@@ -146,7 +144,7 @@ def check_storage() -> list[tuple[str, str, bool | None]]:
 
 async def check_server() -> list[tuple[str, str, bool | None]]:
     """Check if server is running and responsive."""
-    checks = []
+    checks: list[tuple[str, str, bool | None]] = []
 
     try:
         from aragora.server.http_client_pool import get_http_pool
@@ -171,7 +169,7 @@ async def check_server() -> list[tuple[str, str, bool | None]]:
 
 def check_environment() -> list[tuple[str, str, bool | None]]:
     """Check environment configuration."""
-    checks = []
+    checks: list[tuple[str, str, bool | None]] = []
 
     # Python version
     py_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
