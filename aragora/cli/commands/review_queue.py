@@ -33,7 +33,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from aragora.review.invalidation import (
     BaselineMeasurement,
@@ -135,6 +135,7 @@ PARKED_LABELS: tuple[str, ...] = ("stale", "do-not-merge", "wip", "blocked")
 MERGE_QUORUM_CHECK_NAME = "aragora-merge-quorum"
 MERGE_QUORUM_WORKFLOW_NAME = "Aragora Merge Quorum"
 MERGE_QUORUM_JOB_ID = "merge-quorum"
+CHECK_SURFACE_DIAGNOSTIC_LIMIT = 12
 
 LANE_ORDER: dict[str, int] = {
     "ready_now": 0,
@@ -203,6 +204,7 @@ class ReviewPacket:
     machine_recommendation_reason: str
     packet_sha: str
     generated_at: str
+    check_surfaces: dict[str, Any] = field(default_factory=dict)
     protocol: dict[str, Any] = field(default_factory=dict)
     model_review_quorum: dict[str, Any] = field(default_factory=dict)
     advisory_only: bool = True
@@ -1364,6 +1366,79 @@ def _summarize_checks(checks: list) -> tuple[str, bool, bool]:
     return ("no checks", False, False)
 
 
+def _fetch_required_pr_checks(pr_number: int, repo_override: str | None) -> list[dict[str, Any]]:
+    """Fetch GitHub's branch-protection-required PR checks."""
+    args = [
+        "pr",
+        "checks",
+        str(pr_number),
+        "--required",
+        "--json",
+        "name,state,bucket,workflow,link,startedAt,completedAt",
+    ]
+    if repo_override:
+        args.extend(["--repo", repo_override])
+    try:
+        payload = _gh_json(args)
+    except _GhError:
+        return []
+    if not isinstance(payload, list):
+        return []
+    return [item for item in payload if isinstance(item, dict)]
+
+
+def _required_pr_check_bucket(check: dict[str, Any]) -> str:
+    bucket = str(check.get("bucket") or "").strip().lower()
+    if bucket:
+        return bucket
+    state = str(check.get("state") or "").strip().upper()
+    if state in {"SUCCESS", "SUCCESSFUL", "COMPLETED"}:
+        return "pass"
+    if state in {"SKIPPED", "NEUTRAL"}:
+        return "skipping"
+    if state in {"FAILURE", "FAILED", "ERROR", "TIMED_OUT", "ACTION_REQUIRED"}:
+        return "fail"
+    if state in {"CANCELLED", "CANCELED"}:
+        return "cancel"
+    if state in {"PENDING", "QUEUED", "IN_PROGRESS", "EXPECTED", ""}:
+        return "pending"
+    return state.lower()
+
+
+def _summarize_required_pr_checks(checks: list[dict[str, Any]]) -> tuple[str, bool, bool]:
+    """Return ``(summary, has_failures, has_pending)`` for required PR checks."""
+    success = failure = pending = 0
+    for check in checks:
+        if _is_current_merge_quorum_self_check(check):
+            continue
+        bucket = _required_pr_check_bucket(check)
+        if bucket in {"pass", "skipping"}:
+            success += 1
+        elif bucket in {"fail", "cancel"}:
+            failure += 1
+        elif bucket == "pending":
+            pending += 1
+        else:
+            pending += 1
+    total = success + failure + pending
+    if failure > 0:
+        return (f"{failure} failing / {total} required", True, pending > 0)
+    if pending > 0:
+        return (f"{pending} pending / {total} required", False, True)
+    if success > 0:
+        return (f"{success}/{total} required green", False, False)
+    return ("no required checks", False, False)
+
+
+def _effective_required_pr_check_count(checks: list[dict[str, Any]]) -> int:
+    """Count required PR checks after excluding the current merge-quorum self-check."""
+    return sum(
+        1
+        for check in checks
+        if isinstance(check, dict) and not _is_current_merge_quorum_self_check(check)
+    )
+
+
 def _check_rollup_unavailable(pr: dict[str, Any]) -> bool:
     """Return true when an open PR has no GitHub PR-facing check rollup."""
     pr_state = str(pr.get("state") or "").strip().upper()
@@ -1373,6 +1448,306 @@ def _check_rollup_unavailable(pr: dict[str, Any]) -> bool:
         return False
     rollup = pr.get("statusCheckRollup")
     return rollup is None or rollup == []
+
+
+def _repo_slug_from_pr_payload(pr: dict[str, Any], repo_override: str | None) -> str:
+    """Resolve owner/repo from an explicit override or the PR URL."""
+    override = str(repo_override or "").strip()
+    if override:
+        parsed = urlparse(override)
+        if parsed.netloc:
+            parts = [part for part in parsed.path.split("/") if part]
+            if len(parts) >= 2:
+                return f"{parts[0]}/{parts[1]}"
+        if "/" in override and not override.startswith("-"):
+            return override.removeprefix("repos/").strip("/")
+
+    url = str(pr.get("url") or "").strip()
+    parsed = urlparse(url)
+    parts = [part for part in parsed.path.split("/") if part]
+    if len(parts) >= 2:
+        return f"{parts[0]}/{parts[1]}"
+    return ""
+
+
+def _fetch_required_status_check_protection(
+    repo_slug: str,
+    base_ref: str,
+) -> dict[str, Any]:
+    """Best-effort branch-protection required status-check settings."""
+    if not repo_slug or not base_ref:
+        return {"available": False, "contexts": [], "strict": None}
+    try:
+        payload = _gh_json(
+            [
+                "api",
+                f"repos/{repo_slug}/branches/{quote(base_ref, safe='')}"
+                "/protection/required_status_checks",
+            ]
+        )
+    except _GhError:
+        return {"available": False, "contexts": [], "strict": None}
+    if not isinstance(payload, dict):
+        return {"available": False, "contexts": [], "strict": None}
+    required_by_context: dict[str, dict[str, Any]] = {}
+    for item in payload.get("contexts") or []:
+        context = str(item).strip()
+        if context:
+            required_by_context.setdefault(context, {"context": context, "app_id": None})
+    for item in payload.get("checks") or []:
+        if not isinstance(item, dict):
+            continue
+        context = str(item.get("context") or "").strip()
+        if context:
+            app_id = item.get("app_id")
+            required_by_context[context] = {
+                "context": context,
+                "app_id": app_id if app_id is not None else None,
+            }
+    required_checks = list(required_by_context.values())
+    return {
+        "available": True,
+        "contexts": [item["context"] for item in required_checks],
+        "checks": required_checks,
+        "strict": bool(payload.get("strict")),
+    }
+
+
+def _fetch_direct_commit_check_runs(repo_slug: str, head_sha: str) -> list[dict[str, Any]]:
+    """Best-effort direct commit check-runs for diagnostics only."""
+    if not repo_slug or not head_sha:
+        return []
+    try:
+        payload = _gh_json(
+            [
+                "api",
+                f"repos/{repo_slug}/commits/{head_sha}/check-runs?per_page=100",
+            ]
+        )
+    except _GhError:
+        return []
+    if not isinstance(payload, dict):
+        return []
+    runs = payload.get("check_runs") or []
+    return [run for run in runs if isinstance(run, dict)]
+
+
+def _direct_check_run_name(run: dict[str, Any]) -> str:
+    return str(run.get("name") or run.get("context") or "").strip()
+
+
+def _direct_check_run_is_success(run: dict[str, Any]) -> bool:
+    return str(run.get("conclusion") or "").strip().upper() in {
+        "SUCCESS",
+        "SKIPPED",
+        "NEUTRAL",
+    }
+
+
+def _direct_check_run_is_non_green(run: dict[str, Any]) -> bool:
+    status = str(run.get("status") or "").strip().upper()
+    conclusion = str(run.get("conclusion") or "").strip().upper()
+    if conclusion in {"SUCCESS", "SKIPPED", "NEUTRAL"}:
+        return False
+    if conclusion:
+        return True
+    if status in {"", "COMPLETED"}:
+        return True
+    return status in {"QUEUED", "IN_PROGRESS", "PENDING", "EXPECTED"}
+
+
+def _latest_direct_check_runs_by_name(
+    runs: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    latest: dict[str, tuple[str, int, dict[str, Any]]] = {}
+    for index, run in enumerate(runs):
+        name = _direct_check_run_name(run)
+        if not name:
+            continue
+        timestamp = str(
+            run.get("completed_at")
+            or run.get("started_at")
+            or run.get("created_at")
+            or run.get("completedAt")
+            or run.get("startedAt")
+            or run.get("createdAt")
+            or ""
+        )
+        previous = latest.get(name)
+        if (
+            previous is None
+            or timestamp > previous[0]
+            or (timestamp == previous[0] and index < previous[1])
+        ):
+            latest[name] = (timestamp, index, run)
+    return {name: item[2] for name, item in latest.items()}
+
+
+def _direct_check_run_app_id(run: dict[str, Any]) -> Any:
+    app = run.get("app")
+    if isinstance(app, dict):
+        return app.get("id")
+    return None
+
+
+def _direct_check_run_matches_required(run: dict[str, Any], required: dict[str, Any]) -> bool:
+    if _direct_check_run_name(run) != required.get("context"):
+        return False
+    required_app_id = required.get("app_id")
+    if required_app_id is None:
+        return True
+    return _direct_check_run_app_id(run) == required_app_id
+
+
+def _latest_direct_check_run_for_required(
+    runs: list[dict[str, Any]],
+    required: dict[str, Any],
+) -> dict[str, Any] | None:
+    latest: tuple[str, int, dict[str, Any]] | None = None
+    for index, run in enumerate(runs):
+        if not _direct_check_run_matches_required(run, required):
+            continue
+        timestamp = str(
+            run.get("completed_at")
+            or run.get("started_at")
+            or run.get("created_at")
+            or run.get("completedAt")
+            or run.get("startedAt")
+            or run.get("createdAt")
+            or ""
+        )
+        if (
+            latest is None
+            or timestamp > latest[0]
+            or (timestamp == latest[0] and index < latest[1])
+        ):
+            latest = (timestamp, index, run)
+    return latest[2] if latest else None
+
+
+def _build_check_surface_diagnostics(
+    pr: dict[str, Any],
+    *,
+    repo_override: str | None,
+    checks_summary: str,
+    checks_unavailable: bool,
+) -> dict[str, Any]:
+    """Explain PR-facing check rollup separately from direct commit check-runs.
+
+    Direct commit check-runs are a fail-closed fallback only when branch
+    protection required contexts are known and all are successful at the exact
+    PR head.
+    """
+    rollup = pr.get("statusCheckRollup")
+    rollup_count = len(rollup) if isinstance(rollup, list) else None
+    diagnostics: dict[str, Any] = {
+        "pr_rollup": {
+            "available": not checks_unavailable,
+            "count": rollup_count,
+            "summary": checks_summary,
+        }
+    }
+    if not checks_unavailable:
+        return diagnostics
+
+    head_sha = str(pr.get("headRefOid") or "").strip()
+    repo_slug = _repo_slug_from_pr_payload(pr, repo_override)
+    base_ref = str(pr.get("baseRefName") or "").strip()
+    required_status_checks = _fetch_required_status_check_protection(repo_slug, base_ref)
+    required_contexts = required_status_checks["contexts"]
+    required_check_specs = required_status_checks.get("checks") or []
+    strict_required = bool(required_status_checks["strict"])
+    direct_runs = _fetch_direct_commit_check_runs(repo_slug, head_sha)
+    latest_direct_runs = _latest_direct_check_runs_by_name(direct_runs)
+    non_green = [
+        name for name, run in latest_direct_runs.items() if _direct_check_run_is_non_green(run)
+    ]
+    missing_required_contexts: list[str] = []
+    successful_required_contexts: list[str] = []
+    non_success_required_contexts: list[str] = []
+    for required in required_check_specs:
+        context = str(required.get("context") or "").strip()
+        if not context:
+            continue
+        run = _latest_direct_check_run_for_required(direct_runs, required)
+        if run is None:
+            missing_required_contexts.append(context)
+        elif _direct_check_run_is_success(run):
+            successful_required_contexts.append(context)
+        else:
+            non_success_required_contexts.append(context)
+    required_contexts_satisfied = (
+        bool(required_contexts)
+        and not strict_required
+        and not (missing_required_contexts or non_success_required_contexts)
+    )
+    direct_summary = {
+        "available": bool(direct_runs),
+        "total": len(direct_runs),
+        "branch_protection_required_status_checks_available": bool(
+            required_status_checks["available"]
+        ),
+        "branch_protection_strict": strict_required,
+        "required_contexts": required_contexts,
+        "required_checks": required_check_specs,
+        "successful_required_contexts": successful_required_contexts,
+        "missing_required_contexts": missing_required_contexts,
+        "non_success_required_contexts": non_success_required_contexts,
+        "required_contexts_satisfied": required_contexts_satisfied,
+        "non_green_sample": non_green[:CHECK_SURFACE_DIAGNOSTIC_LIMIT],
+        "non_green_count": len(non_green),
+    }
+    diagnostics["direct_commit_check_runs"] = direct_summary
+    if required_contexts_satisfied:
+        diagnostics["diagnosis"] = (
+            "GitHub PR statusCheckRollup is empty, but exact-head direct commit "
+            "check-runs show every branch-protection required context successful; "
+            "merge-packet uses the direct required check-run fallback."
+        )
+        diagnostics["remediation_prompt"] = (
+            "No check-rollup nudge is required for settlement; continue gating on "
+            "exact-head branch-protection required check-runs."
+        )
+    elif direct_runs:
+        if strict_required:
+            diagnostics["diagnosis"] = (
+                "GitHub PR statusCheckRollup is empty while exact-head direct commit "
+                "check-runs exist, but branch protection requires strict base freshness; "
+                "merge-packet fails closed because direct commit check-runs alone do "
+                "not prove the PR is up to date with base."
+            )
+            diagnostics["remediation_prompt"] = (
+                "Refresh the PR-facing check rollup after the branch is current with "
+                "base, or keep the PR blocked. Do not settle from direct commit "
+                "check-runs alone when branch protection is strict."
+            )
+        else:
+            diagnostics["diagnosis"] = (
+                "GitHub PR statusCheckRollup is empty while direct commit check-runs "
+                "exist at the head; merge-packet fails closed because direct checks "
+                "do not satisfy all branch-protection required contexts."
+            )
+            diagnostics["remediation_prompt"] = (
+                "Authorize only a PR-state/check-only nudge to refresh GitHub's PR "
+                "check rollup, or keep the PR blocked and open a bounded CI/tooling "
+                "repair lane. Do not merge from direct commit check-runs alone."
+            )
+    else:
+        diagnostics["diagnosis"] = (
+            "GitHub PR statusCheckRollup is empty and no direct commit check-runs were found."
+        )
+        diagnostics["remediation_prompt"] = (
+            "Wait for checks or authorize a minimal check-only action; do not "
+            "settle or merge while the PR-facing rollup is unavailable."
+        )
+    return diagnostics
+
+
+def _direct_required_check_fallback_satisfied(check_surfaces: dict[str, Any]) -> bool:
+    direct = check_surfaces.get("direct_commit_check_runs")
+    if not isinstance(direct, dict):
+        return False
+    return bool(direct.get("required_contexts_satisfied"))
 
 
 def _latest_status_check_rollup(checks: list) -> list[dict[str, Any]]:
@@ -1484,6 +1859,7 @@ def _build_packet(
             "baseRefOid",
             "state",
             "mergedAt",
+            "baseRefName",
             "isDraft",
             "mergeable",
             "reviewDecision",
@@ -1525,6 +1901,78 @@ def _build_packet(
     if checks_unavailable:
         checks_summary = "no checks reported"
         has_pending = True
+    check_surfaces = _build_check_surface_diagnostics(
+        pr,
+        repo_override=repo_override,
+        checks_summary=checks_summary,
+        checks_unavailable=checks_unavailable,
+    )
+    required_pr_check_gate_satisfied = False
+    if not checks_unavailable and (has_failures or has_pending):
+        required_pr_checks = _fetch_required_pr_checks(number, repo_override)
+        if required_pr_checks:
+            required_summary, required_has_failures, required_has_pending = (
+                _summarize_required_pr_checks(required_pr_checks)
+            )
+            effective_required_count = _effective_required_pr_check_count(required_pr_checks)
+            check_surfaces["required_pr_checks"] = {
+                "available": True,
+                "total": len(required_pr_checks),
+                "effective_total": effective_required_count,
+                "summary": required_summary,
+                "failing_or_cancelled": [
+                    str(check.get("name") or "").strip()
+                    for check in required_pr_checks
+                    if _required_pr_check_bucket(check) in {"fail", "cancel"}
+                ][:CHECK_SURFACE_DIAGNOSTIC_LIMIT],
+                "pending": [
+                    str(check.get("name") or "").strip()
+                    for check in required_pr_checks
+                    if _required_pr_check_bucket(check) == "pending"
+                    and not _is_current_merge_quorum_self_check(check)
+                ][:CHECK_SURFACE_DIAGNOSTIC_LIMIT],
+            }
+            if (
+                effective_required_count > 0
+                and not required_has_failures
+                and not required_has_pending
+            ):
+                required_pr_check_gate_satisfied = True
+                checks_summary = f"{required_summary} (required PR checks)"
+                has_pending = False
+                has_failures = False
+                checks_unavailable = False
+                check_surfaces["effective_gate"] = {
+                    "source": "required_pr_checks",
+                    "summary": checks_summary,
+                }
+                check_surfaces["diagnosis"] = (
+                    "The PR check rollup includes non-required non-green checks, "
+                    "but GitHub reports every branch-protection required check green; "
+                    "merge-packet uses the required PR checks gate."
+                )
+                check_surfaces["remediation_prompt"] = (
+                    "Continue gating on branch-protection required checks; keep "
+                    "non-required shadow/advisory check failures visible but non-blocking."
+                )
+    direct_check_fallback_satisfied = (
+        checks_unavailable and _direct_required_check_fallback_satisfied(check_surfaces)
+    )
+    if direct_check_fallback_satisfied:
+        direct_summary = check_surfaces["direct_commit_check_runs"]
+        successful_required = direct_summary.get("successful_required_contexts") or []
+        required_contexts = direct_summary.get("required_contexts") or []
+        checks_summary = (
+            f"{len(successful_required)}/{len(required_contexts)} required green "
+            "(direct check-runs fallback)"
+        )
+        has_pending = False
+        has_failures = False
+        checks_unavailable = False
+        check_surfaces["effective_gate"] = {
+            "source": "direct_commit_check_runs",
+            "summary": checks_summary,
+        }
     additions = int(pr.get("additions", 0) or 0)
     deletions = int(pr.get("deletions", 0) or 0)
     is_draft = bool(pr.get("isDraft", False))
@@ -1572,6 +2020,18 @@ def _build_packet(
         risk_flags.append("check rollup unavailable")
     if has_failures:
         risk_flags.append(f"checks failing ({checks_summary})")
+    required_pr_check_surface = check_surfaces.get("required_pr_checks") or {}
+    if required_pr_check_gate_satisfied and required_pr_check_surface:
+        risk_flags.append(
+            "non-required PR checks are non-green; "
+            "effective gate uses branch-protection required checks"
+        )
+    direct_summary = check_surfaces.get("direct_commit_check_runs") or {}
+    if direct_check_fallback_satisfied and direct_summary.get("non_green_count", 0):
+        risk_flags.append(
+            "non-required direct check-runs are non-green; "
+            "fallback gates only branch-protection required contexts"
+        )
 
     if settlement_recorded:
         recommendation = "settled_noop"
@@ -1601,7 +2061,17 @@ def _build_packet(
         recommendation_reason = "checks still pending — wait for completion"
     else:
         recommendation = "approve_candidate"
-        recommendation_reason = "all green, bounded diff, no high-risk paths"
+        if required_pr_check_gate_satisfied:
+            recommendation_reason = (
+                "branch-protection required checks green; non-required PR checks are non-green"
+            )
+        elif direct_check_fallback_satisfied and direct_summary.get("non_green_count", 0):
+            recommendation_reason = (
+                "branch-protection required contexts green via direct check-run fallback; "
+                "non-required direct check-runs are non-green"
+            )
+        else:
+            recommendation_reason = "all green, bounded diff, no high-risk paths"
 
     author = ""
     author_payload = pr.get("author")
@@ -1673,6 +2143,7 @@ def _build_packet(
         machine_recommendation_reason=recommendation_reason,
         packet_sha="",
         generated_at=datetime.now(UTC).isoformat(),
+        check_surfaces=check_surfaces,
         protocol=protocol_dict,
         model_review_quorum=_build_model_review_quorum(
             pr=pr,
@@ -1684,6 +2155,7 @@ def _build_packet(
             checks_unavailable=checks_unavailable,
             settlement_recorded=settlement_recorded,
             human_risk_settlement_recorded=human_risk_settlement_recorded,
+            check_surfaces=check_surfaces,
         ),
     )
     packet.packet_sha = _packet_sha(packet)
@@ -1751,6 +2223,8 @@ def _build_merge_authorization_packet(
             "counted_reviewer_ids": quorum["counted_reviewer_ids"],
             "reasons": quorum["reasons"],
         }
+        if packet.check_surfaces:
+            entry["check_surfaces"] = packet.check_surfaces
         entries.append(entry)
 
     return {
@@ -1795,6 +2269,7 @@ def _build_model_review_quorum(
     checks_unavailable: bool = False,
     settlement_recorded: bool = False,
     human_risk_settlement_recorded: bool = False,
+    check_surfaces: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     tier, tier_name, tier_reason = _classify_model_review_tier(files, pr=pr)
     requirement = _tier_requirement(tier)
@@ -1837,6 +2312,13 @@ def _build_model_review_quorum(
         reasons.append("checks are failing; repair before settlement")
     if checks_unavailable and not settlement_recorded:
         reasons.append("checks are unavailable; wait for GitHub check rollup before settlement")
+        if isinstance(check_surfaces, dict) and (
+            check_surfaces.get("direct_commit_check_runs") or {}
+        ).get("total", 0):
+            reasons.append(
+                "direct commit check-runs are visible, but PR statusCheckRollup is empty; "
+                "refresh the PR-facing check rollup before settlement"
+            )
     elif has_pending and not settlement_recorded:
         reasons.append("checks are pending; wait before settlement")
     if not settlement_recorded:
@@ -2984,6 +3466,33 @@ def _render_packet(packet: ReviewPacket) -> None:
         f"across {packet.changed_files} files"
     )
     print(f"checks:          {packet.checks_summary}")
+    if packet.check_surfaces:
+        rollup = packet.check_surfaces.get("pr_rollup") or {}
+        direct = packet.check_surfaces.get("direct_commit_check_runs") or {}
+        required = packet.check_surfaces.get("required_pr_checks") or {}
+        print(
+            "check surfaces:  "
+            f"pr_rollup_available={str(bool(rollup.get('available'))).lower()} "
+            f"pr_rollup_count={rollup.get('count')}"
+        )
+        if required:
+            print(
+                "                 "
+                f"required_pr_checks={required.get('total', 0)} "
+                f"summary={required.get('summary')}"
+            )
+        if direct:
+            print(
+                "                 "
+                f"direct_commit_check_runs={direct.get('total', 0)} "
+                f"successful_required={len(direct.get('successful_required_contexts') or [])}"
+            )
+        diagnosis = str(packet.check_surfaces.get("diagnosis") or "").strip()
+        if diagnosis:
+            print(f"                 diagnosis: {diagnosis}")
+        remediation = str(packet.check_surfaces.get("remediation_prompt") or "").strip()
+        if remediation:
+            print(f"                 remediation: {remediation}")
     print()
     if packet.touched_subsystems:
         print("touched subsystems:")
@@ -3178,6 +3687,25 @@ def _render_merge_authorization_packet(packet: dict[str, Any]) -> None:
         print(f"  {entry.get('title', '')}")
         print(f"  head: {entry.get('head_sha', '')}")
         print(f"  checks: {entry.get('checks_summary', '')}")
+        surfaces = entry.get("check_surfaces") or {}
+        if isinstance(surfaces, dict) and surfaces:
+            rollup = surfaces.get("pr_rollup") or {}
+            direct = surfaces.get("direct_commit_check_runs") or {}
+            print(
+                "  check surfaces: "
+                f"pr_rollup_available={str(bool(rollup.get('available'))).lower()} "
+                f"pr_rollup_count={rollup.get('count')}"
+            )
+            if direct:
+                print(
+                    "  direct checks: "
+                    f"total={direct.get('total', 0)}, "
+                    f"successful_required={len(direct.get('successful_required_contexts') or [])}, "
+                    f"non_green={direct.get('non_green_count', 0)}"
+                )
+            remediation = str(surfaces.get("remediation_prompt") or "").strip()
+            if remediation:
+                print(f"  remediation: {remediation}")
         print(
             "  evidence: "
             f"{len(entry.get('reviewer_signals') or [])} reviewer signal(s), "
