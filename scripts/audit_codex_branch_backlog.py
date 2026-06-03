@@ -37,6 +37,8 @@ ACTIVE_SESSION_FILES = (
 )
 DEFAULT_OUTBOX_DIR = Path(".aragora/automation-outbox")
 DEFAULT_RECEIPT_DIR = Path(".aragora/automation-receipts")
+DEFAULT_GITHUB_STATUS_CACHE = Path(".aragora/automation-github-status/latest.json")
+DEFAULT_CACHED_OPEN_PR_HEADS_MAX_AGE_HOURS = 24
 TERMINAL_RECEIPT_STATUSES = {"published", "already_satisfied", "completed", "skipped"}
 COMMIT_PREFIX_RE = re.compile(r"^[0-9a-f]{7,40}$", re.IGNORECASE)
 BRANCH_IDEMPOTENCY_PREFIXES = ("open-pr-", "already-satisfied-")
@@ -60,6 +62,7 @@ COMPACT_RECORD_EXAMPLE_FIELDS = (
     "divergence_lookup_failed",
     "patch_equivalence_skipped",
     "open_pr",
+    "open_pr_cached",
     "worktree_paths",
     "active_worktree_paths",
     "dirty_worktree_paths",
@@ -85,6 +88,7 @@ class BranchRecord:
     patch_equivalence_skipped: bool
     remote_branch_exists: bool
     open_pr: int | None
+    open_pr_cached: bool
     worktree_paths: list[str]
     dirty_worktree_paths: list[str]
     active_worktree_paths: list[str]
@@ -727,6 +731,107 @@ def open_pr_heads(root: Path, repo: str, prefix: str) -> dict[str, int] | None:
     return heads
 
 
+def _github_status_cache_paths(
+    root: Path,
+    *,
+    outbox_dir: Path | None = None,
+    receipt_dir: Path | None = None,
+) -> list[Path]:
+    candidates: list[Path] = []
+    for state_path in (outbox_dir, receipt_dir):
+        if state_path is None:
+            continue
+        resolved = _repo_relative(root, state_path)
+        if resolved.name in {"automation-outbox", "automation-receipts"}:
+            candidates.append(resolved.parent / "automation-github-status" / "latest.json")
+    candidates.append(
+        _automation_state_default_path(_automation_state_root(root), DEFAULT_GITHUB_STATUS_CACHE)
+    )
+
+    deduped: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        try:
+            key = candidate.resolve()
+        except OSError:
+            key = candidate
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(candidate)
+    return deduped
+
+
+def _parse_cache_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _cache_open_pr_heads_observed_at(payload: Mapping[str, Any]) -> datetime | None:
+    github_queue = payload.get("github_queue")
+    if isinstance(github_queue, Mapping):
+        cached_at = _parse_cache_timestamp(github_queue.get("open_pr_heads_cached_at"))
+        if cached_at is not None:
+            return cached_at
+    return _parse_cache_timestamp(payload.get("generated_at"))
+
+
+def _cache_open_pr_heads_fresh(
+    payload: Mapping[str, Any],
+    *,
+    max_age_hours: int,
+    now: datetime | None = None,
+) -> bool:
+    if max_age_hours <= 0:
+        return False
+    observed_at = _cache_open_pr_heads_observed_at(payload)
+    if observed_at is None:
+        return False
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    return observed_at >= current - timedelta(hours=max_age_hours)
+
+
+def cached_open_pr_heads(
+    root: Path,
+    prefix: str,
+    *,
+    outbox_dir: Path | None = None,
+    receipt_dir: Path | None = None,
+    max_age_hours: int = DEFAULT_CACHED_OPEN_PR_HEADS_MAX_AGE_HOURS,
+) -> set[str]:
+    """Return cached open PR branch heads from local publisher status evidence."""
+
+    for cache_path in _github_status_cache_paths(
+        root, outbox_dir=outbox_dir, receipt_dir=receipt_dir
+    ):
+        payload = _json_mapping(cache_path)
+        if payload is None:
+            continue
+        if not _cache_open_pr_heads_fresh(payload, max_age_hours=max_age_hours):
+            continue
+        github_queue = payload.get("github_queue")
+        if not isinstance(github_queue, Mapping):
+            continue
+        open_pr_heads_value = github_queue.get("open_pr_heads")
+        if not isinstance(open_pr_heads_value, Sequence) or isinstance(
+            open_pr_heads_value, (str, bytes, bytearray)
+        ):
+            continue
+        return {
+            item
+            for item in open_pr_heads_value
+            if isinstance(item, str) and item.startswith(prefix)
+        }
+    return set()
+
+
 def count_ahead(root: Path, base: str, branch: str) -> int | None:
     divergence = branch_divergence(root, base, branch)
     if divergence is None:
@@ -1010,6 +1115,16 @@ def audit(
         open_pr_lookup_skipped = True
     resolved_outbox_dir = _automation_state_path(root, outbox_dir, DEFAULT_OUTBOX_DIR)
     resolved_receipt_dir = _automation_state_path(root, receipt_dir, DEFAULT_RECEIPT_DIR)
+    cached_prs = (
+        cached_open_pr_heads(
+            root,
+            prefix,
+            outbox_dir=resolved_outbox_dir,
+            receipt_dir=resolved_receipt_dir,
+        )
+        if open_pr_lookup_skipped
+        else set()
+    )
     handoff_receipted_branch_heads = terminal_receipted_handoff_branch_heads(
         root,
         outbox_dir=resolved_outbox_dir,
@@ -1038,6 +1153,7 @@ def audit(
     handoff_outbox_patch_ids: set[str] | None = None
 
     records: list[BranchRecord] = []
+    cached_open_pr_lookup_used = False
     patch_equivalence_skipped_branches = 0
     patch_equivalence_budget_exhausted = False
     for row in rows:
@@ -1047,10 +1163,14 @@ def audit(
         dirty_paths = [str(path) for path in paths if dirty_worktree(path)]
         active_paths = [str(path) for path in paths if active_worktree(path)]
         open_pr = prs.get(branch) if prs is not None else None
+        open_pr_cached = open_pr is None and open_pr_lookup_skipped and branch in cached_prs
+        if open_pr_cached:
+            cached_open_pr_lookup_used = True
         handoff_receipted = branch in handoff_receipted_branches
         handoff_outbox = branch in handoff_outbox_branches
         protected_before_patch_check = (
             open_pr is not None
+            or open_pr_cached
             or bool(active_paths)
             or bool(dirty_paths)
             or handoff_receipted
@@ -1161,7 +1281,7 @@ def audit(
             assert ahead_count is not None
             assert behind_count is not None
             category = classify(
-                open_pr=open_pr,
+                open_pr=open_pr if open_pr is not None else (0 if open_pr_cached else None),
                 active_paths=active_paths,
                 dirty_paths=dirty_paths,
                 ahead_count=ahead_count,
@@ -1198,7 +1318,7 @@ def audit(
                 assert ahead_count is not None
                 assert behind_count is not None
                 category = classify(
-                    open_pr=open_pr,
+                    open_pr=open_pr if open_pr is not None else (0 if open_pr_cached else None),
                     active_paths=active_paths,
                     dirty_paths=dirty_paths,
                     ahead_count=ahead_count,
@@ -1230,6 +1350,7 @@ def audit(
                 patch_equivalence_skipped=patch_equivalence_skipped,
                 remote_branch_exists=remote_exists,
                 open_pr=open_pr,
+                open_pr_cached=open_pr_cached,
                 worktree_paths=[str(path) for path in paths],
                 dirty_worktree_paths=dirty_paths,
                 active_worktree_paths=active_paths,
@@ -1294,6 +1415,8 @@ def audit(
         "receipt_dir": str(resolved_receipt_dir),
         "github_health": github_health.to_dict(),
         "open_pr_lookup_skipped": open_pr_lookup_skipped,
+        "cached_open_pr_lookup_used": cached_open_pr_lookup_used,
+        "cached_open_pr_head_count": len(cached_prs),
         "branch_count": len(records),
         "summary": {
             "safe_cleanup_candidates": safe_cleanup,
