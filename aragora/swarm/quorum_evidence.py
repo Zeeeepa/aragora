@@ -27,6 +27,8 @@ all network/process I/O is injected so the orchestrator
 from __future__ import annotations
 
 import asyncio
+import inspect
+import logging
 import re
 import subprocess
 from collections.abc import Callable, Sequence
@@ -34,6 +36,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from aragora.swarm import merge_quorum_io
+
+logger = logging.getLogger(__name__)
 
 # Direct model families whose name appears in the evidence heading and is
 # recognized by the quorum identity resolver as a countable model reviewer.
@@ -314,13 +318,48 @@ def _run_api_agent(family: str, prompt: str) -> ReviewerResult:
         return ReviewerResult(family, "", False, f"create_agent import failed: {exc}")
     try:
         agent = create_agent(family, name=f"{family}_reviewer", role="critic")
-        text = asyncio.run(asyncio.wait_for(agent.generate(prompt), timeout=_REVIEWER_TIMEOUT))
+        text = asyncio.run(_generate_with_api_agent_cleanup(agent, prompt))
     except Exception as exc:
         return ReviewerResult(family, "", False, f"{type(exc).__name__}: {str(exc)[:200]}")
     text = (text or "").strip()
     if not text:
         return ReviewerResult(family, "", False, "empty reviewer output")
     return ReviewerResult(family, _cap_text(text), True)
+
+
+async def _generate_with_api_agent_cleanup(agent: Any, prompt: str) -> str:
+    """Generate with an API-backed agent and close one-shot network resources."""
+    try:
+        return await asyncio.wait_for(agent.generate(prompt), timeout=_REVIEWER_TIMEOUT)
+    finally:
+        await _close_api_agent_resources(agent)
+
+
+async def _close_api_agent_resources(agent: Any) -> None:
+    """Best-effort cleanup for collect-evidence one-shot API reviewer runs."""
+    close = getattr(agent, "close", None)
+    if callable(close):
+        try:
+            result = close()
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:  # noqa: BLE001 - cleanup must not mask reviewer results.
+            logger.debug("collect-evidence API agent close failed: %s", exc)
+
+    try:
+        from aragora.agents.api_agents.common import close_shared_connector
+    except ImportError as exc:
+        logger.debug("collect-evidence shared connector cleanup unavailable: %s", exc)
+        return
+
+    try:
+        # This collector calls API reviewers through a one-shot asyncio.run()
+        # loop, so the shared aiohttp connector must be released before that
+        # loop is torn down. The collector dispatches reviewers serially; if it
+        # ever fans reviewers out, cleanup must move outside the per-reviewer path.
+        await close_shared_connector()
+    except Exception as exc:  # noqa: BLE001 - cleanup must not mask reviewer results.
+        logger.debug("collect-evidence shared connector close failed: %s", exc)
 
 
 def default_prompt_builder(repo: str, pr: int, ctx: dict[str, Any]) -> str:
