@@ -26,6 +26,8 @@ from aragora.cli.commands.review_queue import (
     _build_queue,
     _classify_pr,
     _classify_model_review_tier,
+    _dogfood_evidence_from_comments,
+    _has_blocking_or_negative_verdict,
     _extract_validation_commands,
     _effective_required_pr_check_count,
     _filter_lanes,
@@ -2166,6 +2168,81 @@ class TestModelReviewQuorum:
         assert len(quorum["dogfood_evidence"]) == 1
         assert quorum["dogfood_evidence"][0]["model_family"] == "claude"
         assert "claude" in quorum["counted_reviewer_ids"]
+
+    def test_dogfood_negative_verdict_is_not_counted(self) -> None:
+        head = "cd87c5a1b2db34f04167906553502db3ede9525e"
+        comments = [
+            _codex_openai_comment(
+                body=(
+                    f"Current head: {head}\n"
+                    "Verdict: FAIL\n"
+                    "Blocking findings: found - exact-head evidence is stale."
+                )
+            )
+        ]
+
+        assert _dogfood_evidence_from_comments(comments, head_sha=head) == []
+
+
+class TestHasBlockingOrNegativeVerdict:
+    def test_blocker_value_starting_with_no_letters_is_still_blocking(self) -> None:
+        # Word-boundary regression: "node"/"not working" must not be swallowed
+        # by the non-blocking prefix "no".
+        assert _has_blocking_or_negative_verdict("Blockers: node crashes on startup")
+        assert _has_blocking_or_negative_verdict("Blocking findings: not working under load")
+
+    def test_markdown_heading_labels_are_recognized(self) -> None:
+        assert _has_blocking_or_negative_verdict("### Verdict: FAIL")
+        assert _has_blocking_or_negative_verdict("> **Verdict:** blocked on stale evidence")
+
+    def test_dash_separated_negative_labels_are_recognized(self) -> None:
+        assert _has_blocking_or_negative_verdict("Verdict - FAIL")
+        assert _has_blocking_or_negative_verdict("Blocking findings — found stale evidence")
+
+    def test_multi_line_blocker_lists_are_blocking(self) -> None:
+        assert _has_blocking_or_negative_verdict("Blocking findings:\n- Crash on startup")
+        assert _has_blocking_or_negative_verdict("Blockers:\n\n1. Stale exact-head evidence")
+
+    def test_multi_line_non_blocking_values_remain_countable(self) -> None:
+        assert not _has_blocking_or_negative_verdict("Blockers:\nNone found.")
+        assert not _has_blocking_or_negative_verdict("Blocking findings:")
+
+    def test_decorated_and_numbered_labels_are_recognized(self) -> None:
+        assert _has_blocking_or_negative_verdict("1. Verdict: FAIL")
+        assert _has_blocking_or_negative_verdict("*Verdict*: FAIL")
+        assert _has_blocking_or_negative_verdict("__Verdict__: FAIL")
+
+    def test_failure_verdict_and_inline_list_blockers_are_negative(self) -> None:
+        assert _has_blocking_or_negative_verdict("Verdict: Failure")
+        assert _has_blocking_or_negative_verdict("Blockers: - broken auth flow")
+
+    def test_boolean_and_zero_values_remain_countable(self) -> None:
+        assert not _has_blocking_or_negative_verdict("Blockers: false")
+        assert not _has_blocking_or_negative_verdict("Blocking findings: zero")
+
+    def test_word_boundary_does_not_flag_blockchain_verdict(self) -> None:
+        assert not _has_blocking_or_negative_verdict("Verdict: blockchain summary attached")
+
+    def test_inline_empty_markers_never_consume_the_next_section(self) -> None:
+        # "Blockers: []" is an explicit empty list; the following unrelated
+        # section must not be read as a blocker entry.
+        assert not _has_blocking_or_negative_verdict("Blockers: []\nVerdict: PASS")
+        assert not _has_blocking_or_negative_verdict("Blockers: -\nScope reviewed: full diff")
+        assert not _has_blocking_or_negative_verdict("Blocking findings: [ ]\n\nVerdict: passed")
+
+    def test_empty_blockers_followed_by_new_section_or_heading_is_countable(self) -> None:
+        assert not _has_blocking_or_negative_verdict("Blockers:\nVerdict: PASS")
+        assert not _has_blocking_or_negative_verdict("Blockers:\n### Validation notes")
+
+    def test_lookahead_still_catches_list_items_with_colons(self) -> None:
+        assert _has_blocking_or_negative_verdict("Blockers:\n- crash: stack overflow in parser")
+        assert _has_blocking_or_negative_verdict("Blockers:\n1. regression: settle gate bypassed")
+
+    def test_non_blocking_values_remain_countable(self) -> None:
+        assert not _has_blocking_or_negative_verdict("Blockers: none")
+        assert not _has_blocking_or_negative_verdict("Blocking findings: no blocking findings")
+        assert not _has_blocking_or_negative_verdict("#### Blockers: N/A")
+        assert not _has_blocking_or_negative_verdict("Verdict: **passed**, zero findings.")
 
 
 # --- parenthetical model-family disclosure ---------------------------------
@@ -4740,6 +4817,129 @@ class TestCommandDispatch:
         assert payload["would_count"] is False
         assert payload["current_head_grounding_method"] == "missing_head_sha_citation"
         assert "missing_current_head_grounding" in payload["problems"]
+        assert "no_counted_model_reviewer" in payload["problems"]
+
+    def test_evidence_lint_rejects_wrong_pr_reference(self) -> None:
+        ns = argparse.Namespace(
+            review_queue_command="evidence-lint",
+            pr="7445",
+            head_sha="cd87c5a1b2db34f04167906553502db3ede9525e",
+            head_committed_at="2026-05-23T19:00:00Z",
+            body=_codex_openai_body(
+                body=(
+                    "PR: #9999\n"
+                    "Current head: cd87c5a1b2db34f04167906553502db3ede9525e\n"
+                    "Focused adversarial dogfood found no blockers."
+                )
+            ),
+            body_file=None,
+            author="an0mium",
+            json=True,
+        )
+
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = cmd_review_queue(ns)
+
+        payload = json.loads(out.getvalue())
+        assert rc == 1
+        assert payload["would_count"] is False
+        assert payload["current_head_grounding_method"] == "head_sha_citation"
+        assert payload["current_pr_grounding_method"] == "wrong_pr_citation"
+        assert payload["dogfood_evidence"] == []
+        assert "wrong_pr_reference" in payload["problems"]
+        assert "no_counted_model_reviewer" in payload["problems"]
+
+    def test_evidence_lint_rejects_wrong_pr_number_label(self) -> None:
+        ns = argparse.Namespace(
+            review_queue_command="evidence-lint",
+            pr="7445",
+            head_sha="cd87c5a1b2db34f04167906553502db3ede9525e",
+            head_committed_at="2026-05-23T19:00:00Z",
+            body=_codex_openai_body(
+                body=(
+                    "PR Number: #9999\n"
+                    "Current head: cd87c5a1b2db34f04167906553502db3ede9525e\n"
+                    "Focused adversarial dogfood found no blockers."
+                )
+            ),
+            body_file=None,
+            author="an0mium",
+            json=True,
+        )
+
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = cmd_review_queue(ns)
+
+        payload = json.loads(out.getvalue())
+        assert rc == 1
+        assert payload["would_count"] is False
+        assert payload["current_pr_grounding_method"] == "wrong_pr_citation"
+        assert payload["dogfood_evidence"] == []
+        assert "wrong_pr_reference" in payload["problems"]
+
+    def test_evidence_lint_rejects_wrong_pr_url_reference(self) -> None:
+        ns = argparse.Namespace(
+            review_queue_command="evidence-lint",
+            pr="7445",
+            head_sha="cd87c5a1b2db34f04167906553502db3ede9525e",
+            head_committed_at="2026-05-23T19:00:00Z",
+            body=_codex_openai_body(
+                body=(
+                    "Evidence comment: https://github.com/synaptent/aragora/pull/9999"
+                    "#issuecomment-123\n"
+                    "Exact head reviewed: cd87c5a1b2db34f04167906553502db3ede9525e\n"
+                    "Focused adversarial dogfood found no blockers."
+                )
+            ),
+            body_file=None,
+            author="an0mium",
+            json=True,
+        )
+
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = cmd_review_queue(ns)
+
+        payload = json.loads(out.getvalue())
+        assert rc == 1
+        assert payload["would_count"] is False
+        assert payload["current_head_grounding_method"] == "head_sha_citation"
+        assert payload["current_pr_grounding_method"] == "wrong_pr_citation"
+        assert payload["dogfood_evidence"] == []
+        assert "wrong_pr_reference" in payload["problems"]
+        assert "no_counted_model_reviewer" in payload["problems"]
+
+    def test_evidence_lint_rejects_explicit_blocking_verdict(self) -> None:
+        ns = argparse.Namespace(
+            review_queue_command="evidence-lint",
+            pr="7445",
+            head_sha="cd87c5a1b2db34f04167906553502db3ede9525e",
+            head_committed_at="2026-05-23T19:00:00Z",
+            body=_codex_openai_body(
+                body=(
+                    "PR: #7445\n"
+                    "Current head: cd87c5a1b2db34f04167906553502db3ede9525e\n"
+                    "Verdict: FAIL\n"
+                    "Blocking findings: found - helper can still misclassify stale evidence."
+                )
+            ),
+            body_file=None,
+            author="an0mium",
+            json=True,
+        )
+
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = cmd_review_queue(ns)
+
+        payload = json.loads(out.getvalue())
+        assert rc == 1
+        assert payload["would_count"] is False
+        assert payload["reviewer_signals"] == []
+        assert payload["dogfood_evidence"] == []
+        assert "blocking_or_negative_verdict" in payload["problems"]
         assert "no_counted_model_reviewer" in payload["problems"]
 
     def test_evidence_lint_requires_head_sha_when_timestamp_omitted(self) -> None:

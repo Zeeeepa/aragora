@@ -3446,12 +3446,14 @@ def _lint_evidence_comment(
 ) -> dict[str, Any]:
     """Dry-run whether one proposed comment would satisfy quorum parsers."""
     grounded, grounding_method = _proposed_evidence_head_grounding(body, head_sha)
+    pr_grounded, pr_grounding_method = _proposed_evidence_pr_grounding(body, pr)
+    negative_verdict = _has_blocking_or_negative_verdict(body)
     comment = {
         "author": {"login": author},
         "body": body,
         "createdAt": "",
     }
-    if grounded:
+    if grounded and pr_grounded and not negative_verdict:
         dogfood_evidence = _dogfood_evidence_from_comments([comment])
         reviewer_signals = _model_review_signals_from_comments([comment])
     else:
@@ -3467,8 +3469,12 @@ def _lint_evidence_comment(
         problems.append("empty_body")
     if not grounded:
         problems.append("missing_current_head_grounding")
+    if not pr_grounded:
+        problems.append("wrong_pr_reference")
     if _is_github_actions_author(author):
         problems.append("github_actions_author_not_counted")
+    if negative_verdict:
+        problems.append("blocking_or_negative_verdict")
     if inferred_reviewer == "unknown_model_reviewer":
         problems.append("missing_known_model_reviewer_heading")
     for problem in identity.identity_problems:
@@ -3511,6 +3517,8 @@ def _lint_evidence_comment(
         "identity_problems": list(identity.identity_problems),
         "current_head_grounded": grounded,
         "current_head_grounding_method": grounding_method,
+        "current_pr_grounded": pr_grounded,
+        "current_pr_grounding_method": pr_grounding_method,
         "dogfood_evidence": dogfood_evidence,
         "reviewer_signals": reviewer_signals,
         "counted_reviewer_ids": counted_reviewer_ids,
@@ -3518,6 +3526,42 @@ def _lint_evidence_comment(
         "would_count": bool(counted_reviewer_ids),
         "problems": problems,
     }
+
+
+def _proposed_evidence_pr_grounding(body: str, pr: str) -> tuple[bool, str]:
+    """Fail closed when a proposed evidence comment names the wrong PR.
+
+    Evidence comments are commonly drafted from recursive prompts that include
+    both a PR number and an exact head SHA. Lint mode should not approve a
+    body that is exact-head grounded but visibly copied from a different PR.
+    Comments without an explicit PR citation remain acceptable because the
+    caller already supplies the target ``--pr`` and the head SHA is the primary
+    current-head proof.
+    """
+    normalized_pr = str(pr or "").strip().lstrip("#")
+    if not normalized_pr:
+        return False, "missing_pr_argument"
+    cited = {
+        match.group(1)
+        for match in re.finditer(
+            r"\b(?:PR(?:\s+Number)?|pull\s+request)\s*[:#-]?\s*#?(\d+)\b",
+            str(body or ""),
+            flags=re.IGNORECASE,
+        )
+    }
+    cited.update(
+        match.group(1)
+        for match in re.finditer(
+            r"\bgithub\.com/[^\s)<>]+/pull/(\d+)\b",
+            str(body or ""),
+            flags=re.IGNORECASE,
+        )
+    )
+    if not cited:
+        return True, "no_pr_citation"
+    if normalized_pr in cited:
+        return True, "pr_citation"
+    return False, "wrong_pr_citation"
 
 
 def _proposed_evidence_head_grounding(body: str, head_sha: str) -> tuple[bool, str]:
@@ -3578,6 +3622,104 @@ def _known_model_reviewer_id(item: dict[str, Any]) -> str:
 
 def _is_github_actions_author(author: str) -> bool:
     return str(author or "").strip().lower() in {"github-actions", "github-actions[bot]"}
+
+
+def _has_blocking_or_negative_verdict(body: str) -> bool:
+    """Return True for explicit evidence comments that report blockers.
+
+    Merge quorum should count independent evidence that can support readiness,
+    not a comment that visibly says the reviewer failed or blocked the PR.
+    Keep the parser deliberately label-based so ordinary prose such as
+    "no blocking findings" remains countable.
+    """
+    negative_verdict_prefixes = (
+        "fail",
+        "failed",
+        "failing",
+        "fails",
+        "failure",
+        "block",
+        "blocked",
+        "blocking",
+        "request changes",
+        "request_changes",
+        "changes requested",
+        "reject",
+        "rejected",
+        "not ready",
+        "needs repair",
+    )
+    non_blocking_prefixes = (
+        "none",
+        "none found",
+        "no",
+        "no blockers",
+        "no blocking findings",
+        "not found",
+        "0",
+        "zero",
+        "false",
+        "n/a",
+        "not applicable",
+        "[]",
+    )
+
+    def _starts_with_phrase(value: str, phrases: tuple[str, ...]) -> bool:
+        # Word-boundary matching, not raw prefixes: "no" must cover "no" /
+        # "no blockers" but never "node crashes" or "not working", and
+        # "block" must never cover "blockchain".
+        return any(re.match(rf"{re.escape(phrase)}(?!\w)", value) for phrase in phrases)
+
+    def _strip_decoration(text: str) -> str:
+        # Markdown list/heading/quote decoration and numbered-list markers:
+        # "### Verdict", "1. Verdict", "> **Verdict**" all expose the label.
+        return re.sub(r"^(?:[#>\-*+\s]+|\d+[.)]\s+)+", "", text.strip())
+
+    def _normalize_value(text: str) -> str:
+        text = text.replace("**", "").replace("__", "")
+        return re.sub(r"\s+", " ", text.strip().strip("*_").strip().lower())
+
+    lines = [raw_line.strip() for raw_line in str(body or "").splitlines()]
+    for idx, stripped in enumerate(lines):
+        if not stripped:
+            continue
+        line = _strip_decoration(stripped)
+        line = line.replace("**", "").replace("__", "")
+        match = re.match(r"^(?P<label>[^:—–-]+?)\s*(?::|—|–|-)\s*(?P<value>.*)$", line)
+        if not match:
+            continue
+        normalized_label = re.sub(r"\s+", " ", match.group("label").strip().lower())
+        normalized_label = normalized_label.strip("*_ ")
+        normalized_value = _normalize_value(match.group("value"))
+        if normalized_label in {"verdict", "decision", "recommendation"} and _starts_with_phrase(
+            normalized_value, negative_verdict_prefixes
+        ):
+            return True
+        if normalized_label in {"blocking finding", "blocking findings", "blocker", "blockers"}:
+            candidate = re.sub(r"^(?:[-*+]\s+|\d+[.)]\s+)", "", normalized_value)
+            if candidate in {"-", "*", "[]", "[ ]", "—", "–"}:
+                # An inline empty marker ("Blockers: []", "Blockers: -") is an
+                # explicit "no blockers"; never read the next line as a blocker.
+                continue
+            if not candidate:
+                # The blockers may be listed on the following lines:
+                # "Blocking findings:\n- crash on startup" must stay blocking,
+                # while "Blockers:\nNone found." must stay countable.
+                follow = next((entry for entry in lines[idx + 1 :] if entry), "")
+                is_list_item = bool(re.match(r"^(?:[-*+]\s+|\d+[.)]\s+)", follow))
+                if not is_list_item:
+                    if follow.startswith("#"):
+                        # An empty blockers section followed by a heading.
+                        continue
+                    if re.match(r"^[^:]+?:\s+\S", follow):
+                        # An empty blockers section followed by a new labeled
+                        # section ("Verdict: PASS") is not a blocker entry.
+                        continue
+                candidate = _normalize_value(_strip_decoration(follow))
+            if not candidate or _starts_with_phrase(candidate, non_blocking_prefixes):
+                continue
+            return True
+    return False
 
 
 def _normalize_model_reviewer_id(value: str) -> str:
@@ -3888,6 +4030,8 @@ def _dogfood_evidence_from_comments(
         if not _is_comment_grounded_on_head(comment, head_sha, head_committed_at):
             continue
         body = str(comment.get("body", "") or "")
+        if _has_blocking_or_negative_verdict(body):
+            continue
         lower = body.lower()
         if not any(
             token in lower for token in ("dogfood", "adversarial", "cross-author", "recheck")
@@ -3927,6 +4071,8 @@ def _model_review_signals_from_comments(
         if not _is_comment_grounded_on_head(comment, head_sha, head_committed_at):
             continue
         body = str(comment.get("body", "") or "")
+        if _has_blocking_or_negative_verdict(body):
+            continue
         lower = body.lower()
         if not any(
             token in lower
