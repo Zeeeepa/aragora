@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -112,6 +113,63 @@ def _valid_checks() -> list[dict[str, str]]:
         {"name": "lint", "state": "SUCCESS"},
         {"name": "aragora-merge-quorum", "state": "SUCCESS"},
     ]
+
+
+def test_run_json_timeout_reports_runtime_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_run(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(cmd=args[0], timeout=kwargs.get("timeout"))
+
+    monkeypatch.setattr(settler.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match=r"gh pr view 7423 timed out after 120s"):
+        settler._run_json(["gh", "pr", "view", "7423"], cwd=Path.cwd())
+
+
+def test_run_json_timeout_preserves_zero_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_run(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(cmd=args[0], timeout=0)
+
+    monkeypatch.setattr(settler.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match=r"gh pr view 7423 timed out after 0s"):
+        settler._run_json(["gh", "pr", "view", "7423"], cwd=Path.cwd())
+
+
+def test_run_json_any_timeout_preserves_zero_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_run(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(cmd=args[0], timeout=0)
+
+    monkeypatch.setattr(settler.subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match=r"gh pr view 7423 timed out after 0s"):
+        settler._run_json_any(["gh", "pr", "view", "7423"], cwd=Path.cwd())
+
+
+def test_main_json_reports_live_probe_timeout(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def fake_run(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(cmd=args[0], timeout=kwargs.get("timeout"))
+
+    monkeypatch.setattr(settler.subprocess, "run", fake_run)
+
+    exit_code = settler.main(
+        [
+            "--check",
+            "--pr",
+            "7423",
+            "--head",
+            "57c740022e3c432718462efa12ca79f1df4f674d",
+            "--json",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 2
+    assert payload == {
+        "error": "gh pr view 7423 --repo synaptent/aragora --json headRefOid,state,isDraft,mergeStateStatus,baseRefName,comments,reviews,commits,statusCheckRollup,url timed out after 120s",
+        "ok": False,
+    }
 
 
 def _rest_pull(head: str) -> dict[str, Any]:
@@ -1664,16 +1722,10 @@ def test_settle_only_rejects_unrelated_required_failure(monkeypatch: Any, tmp_pa
 
 
 def test_ambiguous_apply_mode_is_rejected() -> None:
+    head = "57c740022e3c432718462efa12ca79f1df4f674d"
+
     with pytest.raises(SystemExit) as exc:
-        settler.main(
-            [
-                "--apply",
-                "--pr",
-                "7423",
-                "--head",
-                "57c740022e3c432718462efa12ca79f1df4f674d",
-            ]
-        )
+        settler.main(["--apply", "--pr", "7423", "--head", head])
 
     assert exc.value.code == 2
 
