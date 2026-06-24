@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import glob as glob_module
+import hashlib
 import json
 import plistlib
 import re
@@ -206,8 +207,12 @@ def check_outbox(
     """Outbox depth and oldest-item age (archive/ excluded)."""
     name = "outbox_depth"
     if not outbox_dir.is_dir():
-        return _result(name, "ok", f"no outbox dir at {outbox_dir}")
+        result = _result(name, "ok", f"no outbox dir at {outbox_dir}")
+        result["depth"] = 0
+        result["fingerprint"] = _outbox_fingerprint([])
+        return result
     items = sorted(p for p in outbox_dir.glob("*.json") if p.is_file())
+    fingerprint = _outbox_fingerprint(items)
     problems: list[str] = []
     if len(items) > max_items:
         problems.append(f"{len(items)} items queued (max {max_items})")
@@ -220,8 +225,48 @@ def check_outbox(
                 f"{oldest_days:.1f}d old (max {max_age_days}d)"
             )
     if problems:
-        return _result(name, "breach", "; ".join(problems))
-    return _result(name, "ok", f"{len(items)} item(s) queued")
+        result = _result(name, "breach", "; ".join(problems))
+        result["depth"] = len(items)
+        result["fingerprint"] = fingerprint
+        return result
+    result = _result(name, "ok", f"{len(items)} item(s) queued")
+    result["depth"] = len(items)
+    result["fingerprint"] = fingerprint
+    return result
+
+
+def _outbox_fingerprint(items: list[Path]) -> str:
+    digest = hashlib.sha256()
+    for item in sorted(items, key=lambda p: p.name):
+        digest.update(item.name.encode("utf-8", "surrogateescape"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _extract_outbox_depth(check: dict[str, Any]) -> int | None:
+    depth = check.get("depth")
+    if isinstance(depth, int) and depth >= 0:
+        return depth
+    if isinstance(depth, float) and depth.is_integer() and depth >= 0:
+        return int(depth)
+    match = re.search(r"(\d+)\s+item", str(check.get("detail") or ""))
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _extract_outbox_fingerprint(check: dict[str, Any]) -> str | None:
+    fingerprint = check.get("fingerprint")
+    if isinstance(fingerprint, str) and fingerprint:
+        return fingerprint
+    return None
+
+
+def _extract_outbox_sample(checks: Any) -> tuple[int | None, str | None]:
+    for check in checks or []:
+        if isinstance(check, dict) and check.get("check") == "outbox_depth":
+            return _extract_outbox_depth(check), _extract_outbox_fingerprint(check)
+    return None, None
 
 
 def check_outbox_drain_progress(
@@ -234,54 +279,76 @@ def check_outbox_drain_progress(
     """Circuit-breaker: flag an outbox that stays congested without draining.
 
     A drain/conductor loop that keeps running but never reduces the outbox is
-    making no *external* progress — the molasses failure mode in
+    making no net depth progress — the molasses failure mode in
     ``docs/AGENT_OPERATING_CONTRACT.md`` §Conductor (observed June 2026: an outbox
     stuck at its ceiling for ~9 days while the loop only re-messaged stale lanes).
-
-    Best-effort stall heuristic: breaches when the outbox has stayed at/above the
-    alert floor (``min_floor``) across the ``stall_cycles`` window AND is not
-    currently improving (current depth ≥ the most-recent prior reading). It is a
-    coarse no-progress signal for a non-gating diagnostic, not a precise drain
-    detector — a brief sawtooth can evade it; that is acceptable for a
-    circuit-breaker hint. On breach the loop should halt and escalate to the
-    operator instead of mailing more dead letters.
+    When the live outbox is at/above ``min_floor`` and the last ``stall_cycles``
+    ledger entries show no net decrease from the first observed depth and the
+    live depth has not decreased from the previous cycle, breach so the loop
+    halts and escalates to the operator instead of mailing more dead letters.
     """
     name = "outbox_drain_progress"
     if stall_cycles < 1:
-        return _result(name, "unknown", f"stall_cycles must be >= 1, got {stall_cycles}")
-    current = sum(1 for p in outbox_dir.glob("*.json") if p.is_file()) if outbox_dir.is_dir() else 0
+        return _result(name, "unknown", f"invalid stall cycle count {stall_cycles}; must be >= 1")
+    current_items = (
+        sorted(p for p in outbox_dir.glob("*.json") if p.is_file()) if outbox_dir.is_dir() else []
+    )
+    current = len(current_items)
+    current_fingerprint = _outbox_fingerprint(current_items)
     if current < min_floor:
         return _result(name, "ok", f"outbox depth {current} below floor {min_floor}")
     if not ledger.exists():
         return _result(name, "ok", f"no ledger history at {ledger}; cannot assess drain")
-    history: list[int] = []
+    samples: list[tuple[int | None, str | None]] = []
     for line in _read_tail_lines(ledger, stall_cycles + 4):
         try:
             entry = json.loads(line)
         except (ValueError, TypeError):
+            samples.append((None, None))
             continue
-        for check in entry.get("checks") or []:
-            if isinstance(check, dict) and check.get("check") == "outbox_depth":
-                match = re.search(r"(\d+)\s+item", str(check.get("detail") or ""))
-                if match:
-                    history.append(int(match.group(1)))
-                break
-    if len(history) < stall_cycles:
+        if not isinstance(entry, dict):
+            samples.append((None, None))
+            continue
+        samples.append(_extract_outbox_sample(entry.get("checks")))
+    if len(samples) < stall_cycles:
+        usable = sum(1 for depth, _fingerprint in samples if depth is not None)
         return _result(
-            name, "ok", f"only {len(history)} prior cycle(s); need {stall_cycles} to assess drain"
+            name, "ok", f"only {usable} prior cycle(s); need {stall_cycles} to assess drain"
         )
-    window = history[-stall_cycles:]
-    congested = all(depth >= min_floor for depth in window)
-    sequence = [*window, current]
-    not_draining = all(later >= earlier for earlier, later in zip(sequence, sequence[1:]))
+    recent_samples = samples[-stall_cycles:]
+    if any(depth is None for depth, _fingerprint in recent_samples):
+        usable = sum(1 for depth, _fingerprint in recent_samples if depth is not None)
+        return _result(
+            name,
+            "unknown",
+            f"only {usable} usable outbox_depth sample(s) in the last {stall_cycles} ledger cycle(s); cannot assess drain",
+        )
+    window = [depth for depth, _fingerprint in recent_samples if depth is not None]
+    series = [*window, current]
+    congested = all(depth >= min_floor for depth in series)
+    not_draining = current >= window[-1] and current >= window[0]
+    fingerprints = [fingerprint for _depth, fingerprint in recent_samples] + [current_fingerprint]
+    if congested and not_draining and any(not fingerprint for fingerprint in fingerprints):
+        return _result(
+            name,
+            "unknown",
+            "outbox depth did not improve, but recent ledger samples lack item fingerprints; cannot distinguish backlog stall from saturated throughput",
+        )
+    fingerprint_changed = len(set(fingerprints)) > 1
+    if congested and not_draining and fingerprint_changed:
+        return _result(
+            name,
+            "ok",
+            f"outbox depth stayed high but item fingerprint changed (recent depths {window}, now {current}); drain loop has throughput",
+        )
     if congested and not_draining:
         return _result(
             name,
             "breach",
-            f"outbox not draining: depth stayed at/above {min_floor} across {stall_cycles} cycles "
-            f"(recent depths {window}, now {current}) without any decrease — the drain loop is "
-            "making no external progress; HALT it and escalate to the operator, do not keep "
-            "re-messaging stale lanes (§Conductor dead-letter ban)",
+            f"outbox not draining: net depth {window[0]}->{current} stayed at/above {min_floor} "
+            f"across {stall_cycles} prior cycles plus live depth and item fingerprint did not change — "
+            "the drain loop is making no net backlog progress; HALT it and escalate to the operator, "
+            "do not keep re-messaging stale lanes (§Conductor dead-letter ban)",
         )
     return _result(
         name, "ok", f"outbox draining or fluctuating (recent depths {window}, now {current})"
