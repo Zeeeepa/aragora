@@ -78,12 +78,118 @@ def _canonical_repo_root(path: Path = DEFAULT_REPO_ROOT) -> Path:
     return path.resolve()
 
 
+def _git_common_state_root(path: Path = DEFAULT_REPO_ROOT) -> Path | None:
+    common_dir_proc = subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if common_dir_proc.returncode != 0 or not common_dir_proc.stdout.strip():
+        return None
+    common_dir = Path(common_dir_proc.stdout.strip()).resolve()
+    if common_dir.name == ".git":
+        return common_dir.parent / ".aragora"
+    for parent in common_dir.parents:
+        if parent.name == ".git":
+            return parent.parent / ".aragora"
+    return None
+
+
+def _git_toplevel(path: Path) -> Path | None:
+    proc = subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    return Path(proc.stdout.strip()).resolve()
+
+
+def _registered_worktree_roots(repo_root: Path) -> set[Path]:
+    roots: set[Path] = set()
+    toplevel = _git_toplevel(repo_root)
+    if toplevel is not None:
+        roots.add(toplevel)
+    proc = subprocess.run(
+        ["git", "-C", str(repo_root), "worktree", "list", "--porcelain"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return roots
+    for line in proc.stdout.splitlines():
+        if line.startswith("worktree "):
+            roots.add(Path(line.removeprefix("worktree ")).resolve())
+    return roots
+
+
+def _state_root_repo_candidate(state_root: Path) -> Path:
+    return state_root.parent if state_root.name == ".aragora" else state_root
+
+
+def _is_registered_worktree_state_root(state_root: Path, repo_root: Path) -> bool:
+    candidate = _state_root_repo_candidate(state_root)
+    candidate_root = _git_toplevel(candidate)
+    if candidate_root is None or candidate.resolve() != candidate_root:
+        return False
+    return candidate_root in _registered_worktree_roots(repo_root)
+
+
+def _trusted_automation_state_roots(repo_root: Path = DEFAULT_REPO_ROOT) -> set[Path]:
+    roots = {
+        (_canonical_repo_root(repo_root) / ".aragora").resolve(),
+        (DEFAULT_REPO_ROOT / ".aragora").resolve(),
+    }
+    common_state_root = _git_common_state_root(repo_root)
+    if common_state_root is not None:
+        roots.add(common_state_root.resolve())
+    return roots
+
+
+def _normalize_automation_state_root(path: str) -> Path:
+    root = Path(path).expanduser()
+    root = root if root.name == ".aragora" else root / ".aragora"
+    return root.resolve()
+
+
 def _automation_state_root(repo_root: Path = DEFAULT_REPO_ROOT) -> Path:
     configured = os.environ.get("ARAGORA_AUTOMATION_STATE_ROOT")
     if configured:
-        root = Path(configured).expanduser()
-        return root if root.name == ".aragora" else root / ".aragora"
-    return _canonical_repo_root(repo_root) / ".aragora"
+        root = _normalize_automation_state_root(configured)
+        trusted_roots = _trusted_automation_state_roots(repo_root)
+        if root not in trusted_roots and not _is_registered_worktree_state_root(root, repo_root):
+            allowed = ", ".join(str(item) for item in sorted(trusted_roots))
+            raise ValueError(
+                f"untrusted ARAGORA_AUTOMATION_STATE_ROOT {root}; expected one of: "
+                f"{allowed}, or a registered worktree's .aragora"
+            )
+        return root
+    return (_canonical_repo_root(repo_root) / ".aragora").resolve()
+
+
+def _validate_gh_bin(gh_bin: str) -> str:
+    value = str(gh_bin)
+    if value != value.strip() or any(char.isspace() for char in value) or "\0" in value:
+        raise ValueError("gh_bin must be one executable token")
+    if value == "gh":
+        return value
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        raise ValueError("gh_bin must be 'gh' or an absolute executable path")
+    try:
+        resolved = path.resolve()
+    except OSError as exc:
+        raise ValueError(f"gh_bin absolute path could not be resolved: {exc}") from exc
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        raise ValueError("gh_bin absolute path must be an executable file")
+    return str(resolved)
 
 
 def _default_registry_path() -> Path:
@@ -400,8 +506,17 @@ def _merge_commit_oid(payload: dict[str, Any]) -> str:
 
 
 def _fetch_pr_state(*, pr: int, gh_bin: str) -> dict[str, Any]:
+    try:
+        safe_gh_bin = _validate_gh_bin(gh_bin)
+    except ValueError as exc:
+        return {
+            "available": False,
+            "state": None,
+            "error": f"invalid GitHub CLI configuration: {exc}",
+            "command": [],
+        }
     cmd = [
-        gh_bin,
+        safe_gh_bin,
         "pr",
         "view",
         str(pr),
@@ -761,8 +876,26 @@ def audit_merged_pr_lanes(
     """
 
     resolved_at = resolved_at or _utc_now_iso()
-    heartbeat_path = heartbeat_path or _default_heartbeat_path()
-    steering_inbox_root = steering_inbox_root or _default_steering_inbox_root()
+    try:
+        heartbeat_path = heartbeat_path or _default_heartbeat_path()
+        steering_inbox_root = steering_inbox_root or _default_steering_inbox_root()
+    except ValueError as exc:
+        return {
+            "mode": "merged_pr_lane_audit",
+            "apply": bool(apply),
+            "apply_eligible": False,
+            "blocked_reason": "invalid_automation_state_root",
+            "error": str(exc),
+            "finding_count": 0,
+            "findings": [],
+            "github_state": {"available": False, "error": str(exc)},
+            "heartbeat_load_error": None,
+            "owner_release_commands": [],
+            "owner_steering_commands": [],
+            "owner_steering_text": "",
+            "receipt_paths": [],
+            "resolved_count": 0,
+        }
     now_ts = _parse_timestamp(resolved_at) or dt.datetime.now(dt.UTC).timestamp()
     github_state = _fetch_pr_state(pr=pr, gh_bin=gh_bin)
     with _registry_write_lock(registry_path):
@@ -995,8 +1128,23 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    registry_path = args.registry_path or _default_registry_path()
-    receipt_dir = args.receipt_dir or _default_receipt_dir()
+    try:
+        registry_path = args.registry_path or _default_registry_path()
+        receipt_dir = args.receipt_dir or _default_receipt_dir()
+    except ValueError as exc:
+        result = {
+            "blocked_reason": "invalid_automation_state_root",
+            "candidate_count": 0,
+            "error": str(exc),
+            "receipt_dir": None,
+            "registry_path": None,
+            "resolved_count": 0,
+        }
+        if args.json:
+            print(json.dumps(result, indent=2, sort_keys=True))
+        else:
+            print(f"blocked=invalid_automation_state_root: {exc}")
+        return 2
     if args.merged_pr_lane_audit:
         if args.pr is None:
             result = {
@@ -1036,6 +1184,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     print(command)
             if result.get("operator_apply_command"):
                 print(result["operator_apply_command"])
+        if result.get("blocked_reason") == "invalid_automation_state_root":
+            return 2
         if args.apply and result.get("resolved_count", 0) == 0:
             return 2
         return 0

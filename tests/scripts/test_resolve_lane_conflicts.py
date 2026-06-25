@@ -27,12 +27,30 @@ resolver = _load_module("resolve_lane_conflicts.py")
 SCRIPT_PATH = Path(__file__).resolve().parents[2] / "scripts" / "resolve_lane_conflicts.py"
 
 
+def _init_repo_with_origin(
+    path: Path, origin: str = "https://github.com/synaptent/aragora.git"
+) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "init"], cwd=path, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    subprocess.run(
+        ["git", "config", "remote.origin.url", origin],
+        cwd=path,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
 def _write_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
 def _fake_gh(tmp_path: Path, payload: dict[str, Any], *, exit_code: int = 0) -> Path:
-    gh = tmp_path / "fake-gh"
+    gh_dir = tmp_path / f"fake-gh-{len(list(tmp_path.glob('fake-gh-*')))}"
+    gh_dir.mkdir()
+    gh = gh_dir / "gh"
     gh.write_text(
         "#!/usr/bin/env python3\n"
         "import json, sys\n"
@@ -133,6 +151,11 @@ def test_cli_defaults_to_automation_state_root_for_registry(
         encoding="utf-8",
     )
     monkeypatch.setenv("ARAGORA_AUTOMATION_STATE_ROOT", str(state_root))
+    monkeypatch.setattr(
+        resolver,
+        "_trusted_automation_state_roots",
+        lambda repo_root=resolver.DEFAULT_REPO_ROOT: {(state_root / ".aragora").resolve()},
+    )
 
     rc = resolver.main(["--json"])
 
@@ -141,6 +164,210 @@ def test_cli_defaults_to_automation_state_root_for_registry(
     assert payload["registry_path"] == str(registry)
     assert payload["candidate_count"] == 1
     assert payload["candidates"][0]["lane_id"] == "P104-ssd-cleanup-continuation"
+
+
+def test_cli_rejects_untrusted_automation_state_root(
+    tmp_path: Path,
+    monkeypatch: Any,
+    capsys: Any,
+) -> None:
+    trusted_root = (tmp_path / "repo" / ".aragora").resolve()
+    monkeypatch.setenv("ARAGORA_AUTOMATION_STATE_ROOT", str(tmp_path / "attacker-state"))
+    monkeypatch.setattr(
+        resolver,
+        "_trusted_automation_state_roots",
+        lambda repo_root=resolver.DEFAULT_REPO_ROOT: {trusted_root},
+    )
+
+    rc = resolver.main(["--json"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 2
+    assert payload["blocked_reason"] == "invalid_automation_state_root"
+    assert "untrusted ARAGORA_AUTOMATION_STATE_ROOT" in payload["error"]
+    assert str(trusted_root) in payload["error"]
+
+
+def test_cli_explicit_paths_survive_untrusted_automation_state_root(
+    tmp_path: Path,
+    monkeypatch: Any,
+    capsys: Any,
+) -> None:
+    monkeypatch.setenv("ARAGORA_AUTOMATION_STATE_ROOT", str(tmp_path / "attacker-state"))
+    monkeypatch.setattr(
+        resolver,
+        "_trusted_automation_state_roots",
+        lambda repo_root=resolver.DEFAULT_REPO_ROOT: {(tmp_path / "repo" / ".aragora").resolve()},
+    )
+    registry = tmp_path / "lanes.json"
+    receipts = tmp_path / "receipts"
+    registry.write_text("[]", encoding="utf-8")
+    receipts.mkdir()
+
+    rc = resolver.main(
+        [
+            "--json",
+            "--registry-path",
+            str(registry),
+            "--receipt-dir",
+            str(receipts),
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert payload["registry_path"] == str(registry)
+    assert payload["candidate_count"] == 0
+
+
+def test_merged_pr_audit_blocks_untrusted_default_safety_paths(
+    tmp_path: Path,
+    monkeypatch: Any,
+    capsys: Any,
+) -> None:
+    monkeypatch.setenv("ARAGORA_AUTOMATION_STATE_ROOT", str(tmp_path / "attacker-state"))
+    monkeypatch.setattr(
+        resolver,
+        "_trusted_automation_state_roots",
+        lambda repo_root=resolver.DEFAULT_REPO_ROOT: {(tmp_path / "repo" / ".aragora").resolve()},
+    )
+    registry = tmp_path / "lanes.json"
+    receipts = tmp_path / "receipts"
+    registry.write_text("[]", encoding="utf-8")
+    receipts.mkdir()
+
+    rc = resolver.main(
+        [
+            "--merged-pr-lane-audit",
+            "--pr",
+            "7435",
+            "--registry-path",
+            str(registry),
+            "--receipt-dir",
+            str(receipts),
+            "--json",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 2
+    assert payload["blocked_reason"] == "invalid_automation_state_root"
+    assert "untrusted ARAGORA_AUTOMATION_STATE_ROOT" in payload["error"]
+
+
+def test_automation_state_root_accepts_registered_worktree_checkout(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    repo = tmp_path / "repo"
+    shared = tmp_path / "shared-checkout"
+    _init_repo_with_origin(repo)
+    _init_repo_with_origin(shared, "git@github.com:synaptent/aragora.git")
+    (shared / ".aragora").mkdir()
+    monkeypatch.setenv("ARAGORA_AUTOMATION_STATE_ROOT", str(shared))
+    monkeypatch.setattr(
+        resolver,
+        "_registered_worktree_roots",
+        lambda repo_root=resolver.DEFAULT_REPO_ROOT: {repo.resolve(), shared.resolve()},
+    )
+
+    assert resolver._automation_state_root(repo) == (shared / ".aragora").resolve()
+
+
+def test_automation_state_root_rejects_unregistered_same_origin_checkout(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    repo = tmp_path / "repo"
+    shared = tmp_path / "shared-checkout"
+    _init_repo_with_origin(repo)
+    _init_repo_with_origin(shared)
+    (shared / ".aragora").mkdir()
+    monkeypatch.setenv("ARAGORA_AUTOMATION_STATE_ROOT", str(shared))
+    monkeypatch.setattr(
+        resolver,
+        "_registered_worktree_roots",
+        lambda repo_root=resolver.DEFAULT_REPO_ROOT: {repo.resolve()},
+    )
+
+    try:
+        resolver._automation_state_root(repo)
+    except ValueError as exc:
+        assert "untrusted ARAGORA_AUTOMATION_STATE_ROOT" in str(exc)
+        assert "registered worktree" in str(exc)
+    else:
+        raise AssertionError("unregistered same-origin automation state root was accepted")
+
+
+def test_automation_state_root_rejects_different_origin_checkout(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    repo = tmp_path / "repo"
+    shared = tmp_path / "shared-checkout"
+    _init_repo_with_origin(repo)
+    _init_repo_with_origin(shared, "https://github.com/elsewhere/other.git")
+    (shared / ".aragora").mkdir()
+    monkeypatch.setenv("ARAGORA_AUTOMATION_STATE_ROOT", str(shared))
+
+    try:
+        resolver._automation_state_root(repo)
+    except ValueError as exc:
+        assert "untrusted ARAGORA_AUTOMATION_STATE_ROOT" in str(exc)
+    else:
+        raise AssertionError("different-origin automation state root was accepted")
+
+
+def test_automation_state_root_rejects_repo_subdirectory_bypass(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    repo = tmp_path / "repo"
+    _init_repo_with_origin(repo)
+    subdir = repo / "nested"
+    (subdir / ".aragora").mkdir(parents=True)
+    monkeypatch.setenv("ARAGORA_AUTOMATION_STATE_ROOT", str(subdir))
+    monkeypatch.setattr(
+        resolver,
+        "_registered_worktree_roots",
+        lambda repo_root=resolver.DEFAULT_REPO_ROOT: {repo.resolve()},
+    )
+
+    try:
+        resolver._automation_state_root(repo)
+    except ValueError as exc:
+        assert "untrusted ARAGORA_AUTOMATION_STATE_ROOT" in str(exc)
+    else:
+        raise AssertionError("repo subdirectory automation state root was accepted")
+
+
+def test_fetch_pr_state_rejects_unsafe_gh_bin(monkeypatch: Any) -> None:
+    def run_should_not_execute(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("unsafe gh_bin must not reach subprocess")
+
+    monkeypatch.setattr(resolver.subprocess, "run", run_should_not_execute)
+
+    result = resolver._fetch_pr_state(pr=7435, gh_bin="python3 -c gh")
+
+    assert result["available"] is False
+    assert "gh_bin" in result["error"]
+    assert result["command"] == []
+
+
+def test_validate_gh_bin_accepts_absolute_gh_executable(tmp_path: Path) -> None:
+    gh = tmp_path / "gh"
+    gh.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    gh.chmod(0o755)
+
+    assert resolver._validate_gh_bin(str(gh)) == str(gh.resolve())
+
+
+def test_validate_gh_bin_accepts_absolute_executable_wrapper(tmp_path: Path) -> None:
+    wrapper = tmp_path / "gh-wrapper"
+    wrapper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    wrapper.chmod(0o755)
+
+    assert resolver._validate_gh_bin(str(wrapper)) == str(wrapper.resolve())
 
 
 def test_apply_marks_conflict_superseded_and_writes_receipt(tmp_path: Path) -> None:
